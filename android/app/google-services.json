@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "175007329060",
+    "project_id": "room-reservation-expohack",
+    "storage_bucket": "room-reservation-expohack.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:175007329060:android:8fc7e55172484e6cb5a1b1",
+        "android_client_info": {
+          "package_name": "com.example.room_reservation_expohack"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDeqf1VAZjQbaMxeD5c3hhahV5thQhV7VI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
