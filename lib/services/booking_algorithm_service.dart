@@ -40,8 +40,9 @@ class BatchBenchmarkResult {
 }
 
 class BookingAlgorithmService {
-  static const int operatingStart = 420; // 7:00 AM
-  static const int operatingEnd = 1200; // 8:00 PM
+  static const int operatingStart = 480; // 8:00 AM (UniSpace booking hours)
+  static const int operatingEnd = 1020; // 5:00 PM
+  static const int slotStep = 30; // minutes
 
   FirebaseFirestore get _db => FirebaseFirestore.instance;
   CollectionReference<Map<String, dynamic>> get _rooms =>

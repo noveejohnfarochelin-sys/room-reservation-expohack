@@ -15,7 +15,7 @@ class BookingModel {
   final String roomId;
   final String roomName;
   final String departmentName;
-  final String eventName;
+  final String eventName; // the UI calls this "purpose"
   final String requesterName;
   final String organization;
   final String requesterRole;
@@ -28,6 +28,7 @@ class BookingModel {
   final List<String> requiredSignatories;
   final List<String> approvedBy;
   final DateTime createdAt;
+  final String userId; // demo username of the requester ("My requests" filter)
 
   const BookingModel({
     required this.id,
@@ -47,6 +48,7 @@ class BookingModel {
     required this.requiredSignatories,
     required this.approvedBy,
     required this.createdAt,
+    this.userId = '',
   });
 
   factory BookingModel.fromMap(Map<String, dynamic> data, String id) {
@@ -71,6 +73,7 @@ class BookingModel {
           List<String>.from(data['requiredSignatories'] ?? const <String>[]),
       approvedBy: List<String>.from(data['approvedBy'] ?? const <String>[]),
       createdAt: created is Timestamp ? created.toDate() : DateTime.now(),
+      userId: (data['userId'] ?? '') as String,
     );
   }
 
@@ -92,6 +95,7 @@ class BookingModel {
       'requiredSignatories': requiredSignatories,
       'approvedBy': approvedBy,
       'createdAt': Timestamp.fromDate(createdAt),
+      'userId': userId,
     };
   }
 
@@ -125,6 +129,7 @@ class BookingModel {
       requiredSignatories: requiredSignatories ?? this.requiredSignatories,
       approvedBy: approvedBy ?? this.approvedBy,
       createdAt: createdAt ?? this.createdAt,
+      userId: userId,
     );
   }
 
