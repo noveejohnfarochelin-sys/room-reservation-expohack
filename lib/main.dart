@@ -14,6 +14,7 @@ import 'package:room_reservation_expohack/firebase_options.dart';
 import 'package:room_reservation_expohack/services/booking_algorithm_service.dart';
 import 'package:room_reservation_expohack/services/firestore_server.dart';
 import 'package:room_reservation_expohack/services/seed_service.dart';
+import 'package:room_reservation_expohack/widgets/class_schedule_card.dart';
 
 /* ───────────────────────── theme ───────────────────────── */
 
@@ -227,6 +228,31 @@ class SignatureChips extends StatelessWidget {
   }
 }
 
+/// Red box with the signatory's reason, shown on rejected requests (student and approver views).
+class RejectionNote extends StatelessWidget {
+  final Map<String, dynamic> b;
+  const RejectionNote(this.b, {super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    if (b['status'] != 'rejected') return const SizedBox.shrink();
+    final reason = (b['reject_reason'] ?? '').toString().trim();
+    final by = (b['rejected_by'] ?? '').toString().trim();
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(top: 10),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(color: C.busy, borderRadius: BorderRadius.circular(12)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(by.isEmpty ? 'Reason for rejection' : 'Rejected by $by',
+            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w800, color: C.busyInk)),
+        const SizedBox(height: 4),
+        Text(reason.isEmpty ? 'No reason was given.' : reason,
+            style: const TextStyle(fontSize: 13, height: 1.4, color: C.busyInk, fontWeight: FontWeight.w600)),
+      ]),
+    );
+  }
+}
 /* ───────────────────────── logo ───────────────────────── */
 
 /// UniSpace logo: [full] = mark + wordmark + tagline, otherwise the U-door mark only.
@@ -1745,9 +1771,10 @@ class _RoomPageState extends State<RoomPage> {
             for (final b in busyList)
               Padding(
                 padding: const EdgeInsets.only(bottom: 6),
-                child: Row(children: [
-                  StatusChip(b['status'] == 'approved' ? 'Approved' : 'Pending',
-                      b['status'] == 'approved' ? 'bad' : 'warn'),
+                                child: Row(children: [
+                  StatusChip(
+                      b['status'] == 'approved' ? 'Approved' : b['status'] == 'class' ? 'Class' : 'Pending',
+                      b['status'] == 'pending' ? 'warn' : 'bad'),
                   const SizedBox(width: 8),
                   Text('${fmt(b['start_min'] as int)} – ${fmt(b['end_min'] as int)}',
                       style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
@@ -1790,9 +1817,12 @@ class _RoomPageState extends State<RoomPage> {
         ]),
         if (blocked != null) ...[
           const SizedBox(height: 6),
-          Text(
-            'Blocked by ${blocked['status']} booking '
-            '(${fmt(blocked['start_min'] as int)} – ${fmt(blocked['end_min'] as int)}: ${blocked['purpose']}).',
+                    Text(
+            blocked['kind'] == 'class'
+                ? 'Blocked by scheduled class '
+                    '(${fmt(blocked['start_min'] as int)} – ${fmt(blocked['end_min'] as int)}: ${blocked['purpose']}).'
+                : 'Blocked by ${blocked['status']} booking '
+                    '(${fmt(blocked['start_min'] as int)} – ${fmt(blocked['end_min'] as int)}: ${blocked['purpose']}).',
             style: const TextStyle(fontSize: 12.5, color: C.mut),
           ),
         ],
@@ -2039,6 +2069,36 @@ class _MyRequestsPageState extends State<MyRequestsPage> {
     });
   }
 
+    Future<void> _cancel(Map<String, dynamic> b) async {
+    final approved = b['status'] == 'approved';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('Cancel booking'),
+        content: Text(
+          'Cancel ${b['room_name']} on ${shortDate(b['date'].toString())}, '
+          '${fmt(b['start_min'] as int)} – ${fmt(b['end_min'] as int)}?'
+          '${approved ? '\n\nThis request is already approved. Cancelling it will release the room for other people.' : '\n\nThe slot will become available again.'}',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Keep')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Cancel booking')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final r = await Api.call('PATCH', '/bookings/${b['id']}', body: {'status': 'cancelled'});
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(r.ok
+            ? 'Booking cancelled. The room is available again.'
+            : r.error),
+      ),
+    );
+    _load();
+  }
+
   Future<void> _reset() async {
     final ok = await showDialog<bool>(
       context: context,
@@ -2115,6 +2175,7 @@ class _MyRequestsPageState extends State<MyRequestsPage> {
         ),
         const SizedBox(height: 10),
         SignatureChips(b),
+        RejectionNote(b),
         if (widget.admin && (nearCap || contention)) ...[
           const SizedBox(height: 8),
           Wrap(spacing: 6, runSpacing: 6, children: [
@@ -2124,6 +2185,11 @@ class _MyRequestsPageState extends State<MyRequestsPage> {
         ],
         const SizedBox(height: 14),
         Wrap(spacing: 8, runSpacing: 8, children: [
+                    if (!widget.admin &&
+              (st == 'pending' || st == 'approved') &&
+              b['date'].toString().compareTo(iso(DateTime.now())) >= 0)
+            Btn('Cancel booking',
+                small: true, outlined: true, icon: Icons.event_busy_rounded, onTap: () => _cancel(b)),
           Btn('Letter', small: true, outlined: true, icon: Icons.picture_as_pdf_outlined, onTap: () => Api.openLetter(id)),
         ]),
       ]),
@@ -2243,6 +2309,47 @@ class _AdminPageState extends State<AdminPage> {
 
   int get _awaitingMe => all.where((b) => b['status'] == 'pending' && !_iSigned(b)).length;
 
+  Future<String?> _askReason(Map<String, dynamic> b) {
+    final ctrl = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      builder: (c) => StatefulBuilder(
+        builder: (c, setD) => AlertDialog(
+          title: const Text('Reject request'),
+          content: SizedBox(
+            width: 420,
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(
+                '${b['room_name']} · ${shortDate(b['date'].toString())}, '
+                '${fmt(b['start_min'] as int)} – ${fmt(b['end_min'] as int)}',
+                style: const TextStyle(fontSize: 12.5, color: C.mut, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: ctrl,
+                autofocus: true,
+                maxLines: 3,
+                maxLength: 300,
+                onChanged: (_) => setD(() {}),
+                decoration: const InputDecoration(
+                  labelText: 'Reason for rejection',
+                  hintText: 'The requester will see this',
+                ),
+              ),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(c), child: const Text('Cancel')),
+            FilledButton(
+              onPressed: ctrl.text.trim().isEmpty ? null : () => Navigator.pop(c, ctrl.text.trim()),
+              child: const Text('Reject'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Future<void> _decide(Map<String, dynamic> b, String status) async {
     if (status == 'cancelled') {
       final ok = await showDialog<bool>(
@@ -2272,7 +2379,13 @@ class _AdminPageState extends State<AdminPage> {
       );
       if (ok != true) return;
     }
-    final r = await Api.call('PATCH', '/bookings/${b['id']}', body: {'status': status});
+        String? reason;
+    if (status == 'rejected') {
+      reason = await _askReason(b);
+      if (reason == null) return;
+    }
+    final r = await Api.call('PATCH', '/bookings/${b['id']}',
+        body: {'status': status, if (reason != null) 'reason': reason});
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(r.ok ? 'Request ${Api._ref(b['id'].toString())} marked $status.' : r.error)),
@@ -2733,6 +2846,10 @@ class _AdminPageState extends State<AdminPage> {
               'Room admins manage the rooms and bookings. Requests are approved by the signatories '
               '(deans, University Librarian, GSO Head and, above 100 attendees, the University President).',
               'warn'),
+        if (Api.isAdmin) ...[
+          const SizedBox(height: 12),
+          ClassSchedulesCard(onChanged: _load),
+        ],
         const SizedBox(height: 16),
         if (loading)
           const Loading()

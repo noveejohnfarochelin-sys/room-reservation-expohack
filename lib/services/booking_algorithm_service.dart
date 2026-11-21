@@ -1,6 +1,8 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:room_reservation_expohack/models/booking_model.dart';
+import 'package:room_reservation_expohack/models/class_schedule_model.dart';
 import 'package:room_reservation_expohack/models/room_model.dart';
+import 'package:room_reservation_expohack/services/class_schedule_service.dart';
 
 class BookingConflictException implements Exception {
   final String message;
@@ -9,6 +11,13 @@ class BookingConflictException implements Exception {
 
   @override
   String toString() => message;
+}
+
+/// Thrown when a request overlaps a recurring class from `class_schedules`.
+class ClassBlockedException extends BookingConflictException {
+  final ClassScheduleModel schedule;
+  ClassBlockedException(this.schedule, BookingModel placeholder)
+      : super(schedule.blockReason, placeholder);
 }
 
 class TimeSlotOption {
@@ -55,6 +64,29 @@ class BookingAlgorithmService {
 
   static bool overlaps(int aStart, int aEnd, int bStart, int bEnd) =>
       aStart < bEnd && aEnd > bStart;
+
+  /// Describes a class block as a booking-shaped object (status "class") for conflict reporting.
+  static BookingModel classAsBooking(ClassScheduleModel c, String date) {
+    return BookingModel(
+      id: '',
+      roomId: c.roomId,
+      roomName: c.roomName,
+      departmentName: c.collegeCode,
+      eventName: c.label,
+      requesterName: c.instructor,
+      organization: 'Class schedule',
+      requesterRole: 'Instructor',
+      bookingDate: date,
+      startTime: c.startMin,
+      endTime: c.endMin,
+      attendeeCount: 0,
+      includedEquipment: const <String>[],
+      status: 'class',
+      requiredSignatories: const <String>[],
+      approvedBy: const <String>[],
+      createdAt: DateTime.now(),
+    );
+  }
 
   /// Adds "University President" when more than 100 attendees are expected.
   static List<String> effectiveSignatories(
@@ -106,6 +138,19 @@ class BookingAlgorithmService {
   Future<void> createBookingAtomic(BookingModel newBooking) async {
     if (newBooking.endTime <= newBooking.startTime) {
       throw ArgumentError('End time must be after start time.');
+    }
+
+    // Recurring classes are hard-blocked intervals (they never change inside the transaction).
+    final day = DateTime.tryParse(newBooking.bookingDate);
+    if (day != null) {
+      final classes =
+          await ClassScheduleService.forRoomWeekday(newBooking.roomId, day.weekday);
+      final hit = ClassScheduleService.firstOverlap(
+          classes, newBooking.startTime, newBooking.endTime);
+      if (hit != null) {
+        throw ClassBlockedException(
+            hit, classAsBooking(hit, newBooking.bookingDate));
+      }
     }
 
     // Queries are not allowed inside transactions, so find candidates first.
@@ -166,6 +211,11 @@ class BookingAlgorithmService {
     final bookingsSnap =
         await _bookings.where('bookingDate', isEqualTo: bookingDate).get();
 
+    final weekday = DateTime.tryParse(bookingDate)?.weekday;
+    final classes = weekday == null
+        ? <ClassScheduleModel>[]
+        : await ClassScheduleService.forWeekday(weekday);
+
     final rooms =
         roomsSnap.docs.map((d) => RoomModel.fromMap(d.data(), d.id)).toList();
     final active = bookingsSnap.docs
@@ -173,8 +223,11 @@ class BookingAlgorithmService {
         .where((b) => isActive(b.status))
         .toList();
 
-    bool isFree(String roomId, int s, int e) => !active.any(
-        (b) => b.roomId == roomId && overlaps(b.startTime, b.endTime, s, e));
+    bool isFree(String roomId, int s, int e) =>
+        !active.any(
+            (b) => b.roomId == roomId && overlaps(b.startTime, b.endTime, s, e)) &&
+        !classes.any(
+            (c) => c.roomId == roomId && overlaps(c.startMin, c.endMin, s, e));
 
     final bestFit = rooms.where((r) {
       return r.id != targetRoom.id &&

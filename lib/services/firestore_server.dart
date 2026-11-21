@@ -1,8 +1,10 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
 import 'package:room_reservation_expohack/models/booking_model.dart';
+import 'package:room_reservation_expohack/models/class_schedule_model.dart';
 import 'package:room_reservation_expohack/models/room_model.dart';
 import 'package:room_reservation_expohack/services/booking_algorithm_service.dart';
+import 'package:room_reservation_expohack/services/class_schedule_service.dart';
 import 'package:room_reservation_expohack/services/seed_service.dart';
 
 class Resp {
@@ -18,7 +20,8 @@ class Resp {
 ///
 /// It answers the same method + path requests with the same JSON shapes, so the
 /// UI keeps calling `Api.call(...)` unchanged. All booking rules live in
-/// [BookingAlgorithmService] (atomic create, smart alternatives).
+/// [BookingAlgorithmService] (atomic create, smart alternatives). Recurring class
+/// periods from `class_schedules` are hard-blocked intervals everywhere.
 class FirestoreServer {
   FirestoreServer._();
 
@@ -68,6 +71,9 @@ class FirestoreServer {
     return list;
   }
 
+  /// Public access to the rooms (used by the class-schedule PDF parser).
+  static Future<List<RoomModel>> rooms() => _allRooms();
+
   static Future<RoomModel?> _roomById(String id) async {
     for (final r in await _allRooms()) {
       if (r.id == id) return r;
@@ -112,6 +118,8 @@ class FirestoreServer {
         'purpose': b.eventName,
         'required_signatories': b.requiredSignatories,
         'approved_by': b.approvedBy,
+        'reject_reason': b.rejectionReason,
+        'rejected_by': b.rejectedBy,
         'attendees': b.attendeeCount,
         'room_name': r?.name ?? b.roomName,
         'room_capacity': r?.capacity ?? 0,
@@ -148,18 +156,36 @@ class FirestoreServer {
       ..sort((a, b) => a.startTime.compareTo(b.startTime));
   }
 
-  static List<List<int>> _freeWindows(List<BookingModel> busy) {
-    final sorted = [...busy]..sort((a, b) => a.startTime.compareTo(b.startTime));
+  /// Free windows inside opening hours, given busy intervals as [start, end] pairs
+  /// (bookings and class blocks together).
+  static List<List<int>> _freeWindows(List<List<int>> busy) {
+    final sorted = [...busy]..sort((a, b) => a[0].compareTo(b[0]));
     final free = <List<int>>[];
     var cursor = _open;
     for (final b in sorted) {
-      if (b.startTime > cursor) {
-        free.add([cursor, b.startTime < _close ? b.startTime : _close]);
+      if (b[0] > cursor) {
+        free.add([cursor, b[0] < _close ? b[0] : _close]);
       }
-      if (b.endTime > cursor) cursor = b.endTime;
+      if (b[1] > cursor) cursor = b[1];
     }
     if (cursor < _close) free.add([cursor, _close]);
     return free;
+  }
+
+  /// Minutes of opening hours covered by the union of [list].
+  static int _coveredMinutes(List<List<int>> list) {
+    final sorted = [...list]..sort((a, b) => a[0].compareTo(b[0]));
+    var total = 0;
+    var cursor = _open;
+    for (final i in sorted) {
+      final s = i[0] < cursor ? cursor : i[0];
+      final e = i[1] > _close ? _close : i[1];
+      if (e > s) {
+        total += e - s;
+        cursor = e;
+      }
+    }
+    return total;
   }
 
   static String? _validate(Map<String, dynamic> b) {
@@ -280,6 +306,46 @@ class FirestoreServer {
       });
     }
 
+    // ---- class schedules (admin) -------------------------------------------
+
+    // GET /class-schedules
+    if (method == 'GET' && path == '/class-schedules') {
+      if (!isAdmin) return Resp(403, {'error': 'Not allowed.'});
+      final list = await ClassScheduleService.all();
+      return Resp(200, <Map<String, dynamic>>[for (final c in list) c.toMap()]);
+    }
+
+    // POST /class-schedules/import  {college_code, replace, entries: [...]}
+    if (method == 'POST' && path == '/class-schedules/import') {
+      if (!isAdmin) return Resp(403, {'error': 'Not allowed.'});
+      final code = (body['college_code'] ?? '').toString();
+      final raw = body['entries'];
+      if (code.isEmpty || raw is! List || raw.isEmpty) {
+        return Resp(400, {'error': 'Nothing to import.'});
+      }
+      final roomIds = {for (final r in await _allRooms()) r.id};
+      final entries = <ClassScheduleModel>[];
+      for (final m in raw) {
+        if (m is! Map) continue;
+        final c = ClassScheduleModel.fromMap(Map<String, dynamic>.from(m), '');
+        if (!roomIds.contains(c.roomId)) continue;
+        if (c.dayOfWeek < 1 || c.dayOfWeek > 7 || c.startMin >= c.endMin) continue;
+        entries.add(c);
+      }
+      if (entries.isEmpty) return Resp(400, {'error': 'No valid class blocks to import.'});
+      final saved = await ClassScheduleService.save(entries,
+          collegeCode: code, replace: body['replace'] == true);
+      return Resp(200, {'imported': saved});
+    }
+
+    // DELETE /class-schedules  {college_code?: 'CCI'}  (empty = everything)
+    if (method == 'DELETE' && path == '/class-schedules') {
+      if (!isAdmin) return Resp(403, {'error': 'Not allowed.'});
+      final code = (body['college_code'] ?? '').toString();
+      final n = await ClassScheduleService.clear(collegeCode: code.isEmpty ? null : code);
+      return Resp(200, {'deleted': n});
+    }
+
     // GET /colleges/:code/rooms?date=
     if (method == 'GET' && seg.length == 3 && seg[0] == 'colleges' && seg[2] == 'rooms') {
       final code = seg[1];
@@ -287,10 +353,19 @@ class FirestoreServer {
       final rooms =
           (await _allRooms()).where((r) => !r.isStandalone && r.code == code).toList();
       final day = await _activeOnDate(date);
+      final weekday = DateTime.tryParse(date)?.weekday;
+      final classes = weekday == null
+          ? <ClassScheduleModel>[]
+          : await ClassScheduleService.forWeekday(weekday);
       return Resp(200, <Map<String, dynamic>>[
         for (final r in rooms)
           () {
-            final busy = day.where((b) => b.roomId == r.id).toList();
+            final busy = <List<int>>[
+              for (final b in day)
+                if (b.roomId == r.id) [b.startTime, b.endTime],
+              for (final c in classes)
+                if (c.roomId == r.id) [c.startMin, c.endMin],
+            ];
             final freeMin =
                 _freeWindows(busy).fold<int>(0, (sum, w) => sum + (w[1] - w[0]));
             return <String, dynamic>{
@@ -311,17 +386,37 @@ class FirestoreServer {
 
       if (seg[2] == 'calendar') {
         final month = q['month'] ?? _today().substring(0, 7);
+        final parts = month.split('-');
+        final year = int.tryParse(parts[0]);
+        final mon = parts.length > 1 ? int.tryParse(parts[1]) : null;
         final snap = await _bookings.where('roomId', isEqualTo: rid).get();
-        final minutes = <String, int>{};
+        final intervals = <String, List<List<int>>>{};
         final pending = <String, bool>{};
         for (final b in _toBookings(snap)) {
           if (!BookingAlgorithmService.isActive(b.status)) continue;
           if (!b.bookingDate.startsWith('$month-')) continue;
-          minutes[b.bookingDate] = (minutes[b.bookingDate] ?? 0) + (b.endTime - b.startTime);
+          intervals.putIfAbsent(b.bookingDate, () => <List<int>>[]).add([b.startTime, b.endTime]);
           if (b.status == 'pending') pending[b.bookingDate] = true;
         }
+        if (year != null && mon != null) {
+          final classes = await ClassScheduleService.forRoom(rid);
+          if (classes.isNotEmpty) {
+            final days = DateTime(year, mon + 1, 0).day;
+            for (var d = 1; d <= days; d++) {
+              final wd = DateTime(year, mon, d).weekday;
+              final ds = '$month-${d.toString().padLeft(2, '0')}';
+              for (final c in classes) {
+                if (c.dayOfWeek == wd) {
+                  intervals.putIfAbsent(ds, () => <List<int>>[]).add([c.startMin, c.endMin]);
+                }
+              }
+            }
+          }
+        }
         final out = <String, dynamic>{};
-        minutes.forEach((date, m) {
+        intervals.forEach((date, list) {
+          final m = _coveredMinutes(list);
+          if (m <= 0) return;
           out[date] = <String, dynamic>{
             'state': m >= _close - _open ? 'full' : 'partial',
             'pending': pending[date] ?? false,
@@ -333,20 +428,35 @@ class FirestoreServer {
       if (seg[2] == 'day') {
         final date = q['date'] ?? _today();
         final busy = await _activeForRoomDay(rid, date);
+        final wd = DateTime.tryParse(date)?.weekday;
+        final classes = wd == null
+            ? <ClassScheduleModel>[]
+            : await ClassScheduleService.forRoomWeekday(rid, wd);
+        final entries = <Map<String, dynamic>>[
+          for (final b in busy)
+            <String, dynamic>{
+              'start_min': b.startTime,
+              'end_min': b.endTime,
+              'status': b.status,
+              'purpose': b.eventName,
+            },
+          for (final c in classes)
+            <String, dynamic>{
+              'start_min': c.startMin,
+              'end_min': c.endMin,
+              'status': 'class',
+              'purpose': c.label,
+            },
+        ]..sort((a, b) => (a['start_min'] as int).compareTo(b['start_min'] as int));
         return Resp(200, <String, dynamic>{
           'open': _open,
           'close': _close,
           'step': _step,
-          'busy': <Map<String, dynamic>>[
-            for (final b in busy)
-              <String, dynamic>{
-                'start_min': b.startTime,
-                'end_min': b.endTime,
-                'status': b.status,
-                'purpose': b.eventName,
-              }
-          ],
-          'free': _freeWindows(busy),
+          'busy': entries,
+          'free': _freeWindows([
+            for (final b in busy) [b.startTime, b.endTime],
+            for (final c in classes) [c.startMin, c.endMin],
+          ]),
         });
       }
     }
@@ -405,10 +515,14 @@ class FirestoreServer {
                 .where((r) => !r.isStandalone && r.code == room.code)
                 .take(5)
                 .toList();
+        final cls = e is ClassBlockedException ? e.schedule : null;
         return Resp(409, <String, dynamic>{
-          'error': 'Time conflict detected! Pick a ranked alternative below in 1 tap.',
+          'error': cls != null
+              ? '${cls.blockReason}. Pick a ranked alternative below in 1 tap.'
+              : 'Time conflict detected! Pick a ranked alternative below in 1 tap.',
           'suggestions': <String, dynamic>{
             'blockedBy': <String, dynamic>{
+              'kind': cls != null ? 'class' : 'booking',
               'status': e.conflictingBooking.status,
               'start_min': e.conflictingBooking.startTime,
               'end_min': e.conflictingBooking.endTime,
@@ -482,7 +596,10 @@ class FirestoreServer {
           'error': 'Only the signatories (deans, librarian, GSO head, president) can approve or reject.'
         });
       }
-
+            final reason = (body['reason'] ?? '').toString().trim();
+      if (next == 'rejected' && reason.isEmpty) {
+        return Resp(400, {'error': 'Please give a reason for rejecting this request.'});
+      }
       final ref = _bookings.doc(seg[1]);
 
       // Signature: delegated to BookingAlgorithmService.approveBooking (transactional; the booking
@@ -558,10 +675,15 @@ class FirestoreServer {
             }
           }
         }
-        tx.update(ref, <String, dynamic>{
+                tx.update(ref, <String, dynamic>{
           'status': next,
-          // Undo removes only this signatory's own signature.
-          if (next == 'pending') 'approvedBy': [for (final s in b.approvedBy) if (s != sigName) s],
+          if (next == 'rejected') ...{'rejectionReason': reason, 'rejectedBy': sigName},
+          // Undo removes only this signatory's own signature and clears any rejection reason.
+          if (next == 'pending') ...{
+            'approvedBy': [for (final s in b.approvedBy) if (s != sigName) s],
+            'rejectionReason': '',
+            'rejectedBy': '',
+          },
         });
       });
 

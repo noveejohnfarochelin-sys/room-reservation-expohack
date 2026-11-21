@@ -29,6 +29,8 @@ class BookingModel {
   final List<String> approvedBy;
   final DateTime createdAt;
   final String userId; // demo username of the requester ("My requests" filter)
+  final String rejectionReason; // why a signatory rejected the request
+  final String rejectedBy; // signatory who rejected it
 
   const BookingModel({
     required this.id,
@@ -49,6 +51,8 @@ class BookingModel {
     required this.approvedBy,
     required this.createdAt,
     this.userId = '',
+    this.rejectionReason = '',
+    this.rejectedBy = '',
   });
 
   factory BookingModel.fromMap(Map<String, dynamic> data, String id) {
@@ -74,6 +78,8 @@ class BookingModel {
       approvedBy: List<String>.from(data['approvedBy'] ?? const <String>[]),
       createdAt: created is Timestamp ? created.toDate() : DateTime.now(),
       userId: (data['userId'] ?? '') as String,
+      rejectionReason: (data['rejectionReason'] ?? '') as String,
+      rejectedBy: (data['rejectedBy'] ?? '') as String,
     );
   }
 
@@ -96,6 +102,8 @@ class BookingModel {
       'approvedBy': approvedBy,
       'createdAt': Timestamp.fromDate(createdAt),
       'userId': userId,
+      'rejectionReason': rejectionReason,
+      'rejectedBy': rejectedBy,
     };
   }
 
@@ -130,6 +138,8 @@ class BookingModel {
       approvedBy: approvedBy ?? this.approvedBy,
       createdAt: createdAt ?? this.createdAt,
       userId: userId,
+      rejectionReason: rejectionReason,
+      rejectedBy: rejectedBy,
     );
   }
 

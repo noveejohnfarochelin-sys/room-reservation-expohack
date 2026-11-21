@@ -39,6 +39,8 @@ dependencies:
   intl: ^0.20.3
   pdf: ^3.13.1
   printing: ^5.15.1
+  file_picker: ^13.4.0
+  syncfusion_flutter_pdf: ^35.2.12
 
 dev_dependencies:
   flutter_test:
