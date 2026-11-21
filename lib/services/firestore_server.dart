@@ -32,7 +32,18 @@ class FirestoreServer {
   static const Map<String, Map<String, String>> _users = {
     'student': {'pw': 'student', 'id': 'student', 'name': 'Demo Student', 'role': 'requester'},
     'student2': {'pw': 'student2', 'id': 'student2', 'name': 'Second Student', 'role': 'requester'},
+    // Room admin: handles the rooms and bookings (monitor, cancel, reset). Does NOT sign requests.
     'admin': {'pw': 'admin', 'id': 'admin', 'name': 'Room Admin', 'role': 'admin'},
+    // Signatories: the only accounts that approve/reject. 'signatory' must equal the name stored in
+    // RoomModel.requiredSignatories / BookingModel.requiredSignatories.
+    'cea_dean': {'pw': 'cea_dean', 'id': 'cea_dean', 'name': 'CEA Dean', 'role': 'signatory', 'signatory': 'CEA Dean'},
+    'cci_dean': {'pw': 'cci_dean', 'id': 'cci_dean', 'name': 'CCI Dean', 'role': 'signatory', 'signatory': 'CCI Dean'},
+    'coe_dean': {'pw': 'coe_dean', 'id': 'coe_dean', 'name': 'COE Dean', 'role': 'signatory', 'signatory': 'COE Dean'},
+    'cit_dean': {'pw': 'cit_dean', 'id': 'cit_dean', 'name': 'CIT Dean', 'role': 'signatory', 'signatory': 'CIT Dean'},
+    'cgbe_dean': {'pw': 'cgbe_dean', 'id': 'cgbe_dean', 'name': 'CGBE Dean', 'role': 'signatory', 'signatory': 'CGBE Dean'},
+    'librarian': {'pw': 'librarian', 'id': 'librarian', 'name': 'University Librarian', 'role': 'signatory', 'signatory': 'University Librarian'},
+    'gso': {'pw': 'gso', 'id': 'gso', 'name': 'GSO Head', 'role': 'signatory', 'signatory': 'GSO Head'},
+    'president': {'pw': 'president', 'id': 'president', 'name': 'University President', 'role': 'signatory', 'signatory': 'University President'},
   };
 
   static final BookingAlgorithmService _service = BookingAlgorithmService();
@@ -86,7 +97,9 @@ class FirestoreServer {
         'addressee': _addressee(r),
       };
 
-  static Map<String, dynamic> _bookingOut(BookingModel b, RoomModel? r) => <String, dynamic>{
+  static Map<String, dynamic> _bookingOut(BookingModel b, RoomModel? r,
+          [List<BookingModel>? all]) =>
+      <String, dynamic>{
         'id': b.id,
         'room_id': b.roomId,
         'user_id': b.userId,
@@ -97,8 +110,20 @@ class FirestoreServer {
         'requester_name': b.requesterName,
         'organization': b.organization,
         'purpose': b.eventName,
+        'required_signatories': b.requiredSignatories,
+        'approved_by': b.approvedBy,
         'attendees': b.attendeeCount,
         'room_name': r?.name ?? b.roomName,
+        'room_capacity': r?.capacity ?? 0,
+        'near_capacity': r != null && r.capacity > 0 && b.attendeeCount / r.capacity >= 0.85,
+        'has_contention': all != null &&
+            all.any((o) =>
+                o.id != b.id &&
+                o.roomId == b.roomId &&
+                o.bookingDate == b.bookingDate &&
+                BookingAlgorithmService.isActive(o.status) &&
+                b.startTime < o.endTime &&
+                b.endTime > o.startTime),
         'college': r == null ? b.departmentName : _label(r),
         'code': r?.code ?? '',
         'addressee': r == null ? 'The Dean' : _addressee(r),
@@ -182,7 +207,7 @@ class FirestoreServer {
       }
       return Resp(200, {
         'token': 'tok-${u['id']}',
-        'user': {'id': u['id'], 'name': u['name'], 'role': u['role']},
+        'user': {'id': u['id'], 'name': u['name'], 'role': u['role'], 'signatory': u['signatory']},
       });
     }
 
@@ -190,6 +215,8 @@ class FirestoreServer {
     final me = uname == null ? null : _users[uname];
     if (me == null) return Resp(401, {'error': 'Please sign in.'});
     final isAdmin = me['role'] == 'admin';
+    final isSignatory = me['role'] == 'signatory';
+    final sigName = me['signatory'] ?? '';
 
     // GET /colleges  (5 colleges + library)
     if (method == 'GET' && path == '/colleges') {
@@ -316,6 +343,7 @@ class FirestoreServer {
                 'start_min': b.startTime,
                 'end_min': b.endTime,
                 'status': b.status,
+                'purpose': b.eventName,
               }
           ],
           'free': _freeWindows(busy),
@@ -360,7 +388,7 @@ class FirestoreServer {
       try {
         await _service.createBookingAtomic(draft);
         return Resp(201, {'status': 'pending'});
-      } on BookingConflictException {
+      } on BookingConflictException catch (e) {
         final rec = await _service.getSmartAlternatives(
           targetRoom: room,
           bookingDate: draft.bookingDate,
@@ -378,8 +406,14 @@ class FirestoreServer {
                 .take(5)
                 .toList();
         return Resp(409, <String, dynamic>{
-          'error': 'That time is already taken.',
+          'error': 'Time conflict detected! Pick a ranked alternative below in 1 tap.',
           'suggestions': <String, dynamic>{
+            'blockedBy': <String, dynamic>{
+              'status': e.conflictingBooking.status,
+              'start_min': e.conflictingBooking.startTime,
+              'end_min': e.conflictingBooking.endTime,
+              'purpose': e.conflictingBooking.eventName,
+            },
             'sameRoom': nearest == null
                 ? null
                 : <String, dynamic>{
@@ -388,7 +422,13 @@ class FirestoreServer {
                   },
             'otherRooms': <Map<String, dynamic>>[
               for (final r in others)
-                <String, dynamic>{'id': r.id, 'name': r.name, 'capacity': r.capacity}
+                <String, dynamic>{
+                  'id': r.id,
+                  'name': r.name,
+                  'kind': r.kind,
+                  'capacity': r.capacity,
+                  'fit_label': r.capacity - attendees <= 10 ? 'Best size fit' : '${r.capacity} seats',
+                }
             ],
           },
         });
@@ -405,10 +445,13 @@ class FirestoreServer {
       ]);
     }
 
-    // GET /bookings  (admin)
+    // GET /bookings  (admin: all · signatory: only requests that need their signature)
     if (method == 'GET' && path == '/bookings') {
-      if (!isAdmin) return Resp(403, {'error': 'Not allowed.'});
-      final list = _toBookings(await _bookings.get());
+      if (!isAdmin && !isSignatory) return Resp(403, {'error': 'Not allowed.'});
+      final every = _toBookings(await _bookings.get());
+      final list = every
+          .where((b) => !isSignatory || b.requiredSignatories.contains(sigName))
+          .toList();
       list.sort((a, b) {
         final pa = a.status == 'pending' ? 0 : 1;
         final pb = b.status == 'pending' ? 0 : 1;
@@ -418,20 +461,59 @@ class FirestoreServer {
       });
       final rooms = {for (final r in await _allRooms()) r.id: r};
       return Resp(200, <Map<String, dynamic>>[
-        for (final b in list) _bookingOut(b, rooms[b.roomId])
+        for (final b in list) _bookingOut(b, rooms[b.roomId], every)
       ]);
     }
 
-    // PATCH /bookings/:id   admin: approved | rejected | cancelled
-    //                       requester: cancelled (own bookings only)
+    // PATCH /bookings/:id
+    //   signatory : approved (adds their signature) | rejected | pending (undo their decision),
+    //               only for requests that list them in requiredSignatories
+    //   admin     : cancelled (frees the slot)         – admins never sign
+    //   requester : cancelled (own bookings only)
     if (method == 'PATCH' && seg.length == 2 && seg[0] == 'bookings') {
       final next = (body['status'] ?? '').toString();
-      if (!const ['approved', 'rejected', 'cancelled'].contains(next)) {
+      if (!const ['approved', 'rejected', 'cancelled', 'pending'].contains(next)) {
         return Resp(400, {'error': 'Bad status.'});
       }
-      if (!isAdmin && next != 'cancelled') return Resp(403, {'error': 'Not allowed.'});
+      if (next == 'cancelled') {
+        if (isSignatory) return Resp(403, {'error': 'Signatories approve or reject requests.'});
+      } else if (!isSignatory) {
+        return Resp(403, {
+          'error': 'Only the signatories (deans, librarian, GSO head, president) can approve or reject.'
+        });
+      }
 
       final ref = _bookings.doc(seg[1]);
+
+      // Signature: delegated to BookingAlgorithmService.approveBooking (transactional; the booking
+      // becomes 'approved' only when every required signatory has signed).
+      if (next == 'approved') {
+        final data = (await ref.get()).data();
+        if (data == null) return Resp(404, {'error': 'Request not found.'});
+        final b = BookingModel.fromMap(data, ref.id);
+        if (!b.requiredSignatories.contains(sigName)) {
+          return Resp(403, {'error': 'This request does not need your signature.'});
+        }
+        if (b.status != 'pending') {
+          return Resp(400, {'error': 'That request can no longer be changed.'});
+        }
+        await _service.approveBooking(bookingId: ref.id, signatoryName: sigName);
+        return Resp(200, {'ok': true});
+      }
+
+      // Putting a rejected request back to pending re-holds its slot, so load the same-room,
+      // same-day bookings first and re-check them inside the transaction.
+      var peers = <DocumentReference<Map<String, dynamic>>>[];
+      if (next == 'pending') {
+        final pre = (await ref.get()).data();
+        if (pre != null) {
+          final snap = await _bookings
+              .where('roomId', isEqualTo: pre['roomId'])
+              .where('bookingDate', isEqualTo: pre['bookingDate'])
+              .get();
+          peers = [for (final d in snap.docs) if (d.id != ref.id) d.reference];
+        }
+      }
       String? failure;
       await _db.runTransaction((tx) async {
         failure = null;
@@ -442,22 +524,44 @@ class FirestoreServer {
           return;
         }
         final b = BookingModel.fromMap(data, snap.id);
-        if (!isAdmin && b.userId != me['id']) {
+        if (isSignatory && !b.requiredSignatories.contains(sigName)) {
           failure = 'forbidden';
           return;
         }
-        // Only pending requests can be approved/rejected; only active ones cancelled.
+        if (!isAdmin && !isSignatory && b.userId != me['id']) {
+          failure = 'forbidden';
+          return;
+        }
         final allowed = next == 'cancelled'
             ? BookingAlgorithmService.isActive(b.status)
-            : b.status == 'pending';
+            : next == 'rejected'
+                ? b.status == 'pending'
+                // undo: after approving/rejecting, or to withdraw a signature while still pending
+                : (b.status == 'approved' ||
+                    b.status == 'rejected' ||
+                    (b.status == 'pending' && b.approvedBy.contains(sigName)));
         if (!allowed) {
           failure = 'state';
           return;
         }
+        if (next == 'pending' && !BookingAlgorithmService.isActive(b.status)) {
+          for (final p in peers) {
+            final fresh = await tx.get(p);
+            final pd = fresh.data();
+            if (pd == null) continue;
+            final o = BookingModel.fromMap(pd, fresh.id);
+            if (BookingAlgorithmService.isActive(o.status) &&
+                o.startTime < b.endTime &&
+                o.endTime > b.startTime) {
+              failure = 'conflict';
+              return;
+            }
+          }
+        }
         tx.update(ref, <String, dynamic>{
           'status': next,
-          // Admin approval counts as every required signatory approving.
-          if (next == 'approved') 'approvedBy': b.requiredSignatories,
+          // Undo removes only this signatory's own signature.
+          if (next == 'pending') 'approvedBy': [for (final s in b.approvedBy) if (s != sigName) s],
         });
       });
 
@@ -465,6 +569,9 @@ class FirestoreServer {
       if (failure == 'forbidden') return Resp(403, {'error': 'Not allowed.'});
       if (failure == 'state') {
         return Resp(400, {'error': 'That request can no longer be changed.'});
+      }
+      if (failure == 'conflict') {
+        return Resp(409, {'error': 'Another active request already holds this slot.'});
       }
       return Resp(200, {'ok': true});
     }

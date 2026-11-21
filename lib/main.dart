@@ -1,12 +1,15 @@
-// UniSpace (ISATU) – Flutter UI in the "StayNest" style.
-// FIREBASE VERSION: every screen reads and writes Cloud Firestore through the
-// data layer (BookingModel, RoomModel, BookingAlgorithmService, FirestoreServer,
-// SeedService). No in-memory / mock data is used.
-// Demo logins: student/student, student2/student2, admin/admin
-// Tip: CCI > Room 101 already has bookings today – try 10:00-11:00 to see conflict suggestions.
+// UniSpace (ISATU) – Flutter UI in the "StayNest" style + Smart Conflict Resolver.
+// FIREBASE VERSION: all data comes from Cloud Firestore through BookingModel, RoomModel,
+// BookingAlgorithmService, FirestoreServer and SeedService. Letters can be downloaded as PDF.
+// Demo logins: student/student, student2/student2, admin/admin (or use the 1-tap buttons).
+// Tip: pick CCI > Room 101, choose today on the calendar, keep 10:00-11:00 and submit to see the smart conflict resolver.
 
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:printing/printing.dart';
 import 'package:room_reservation_expohack/firebase_options.dart';
 import 'package:room_reservation_expohack/services/booking_algorithm_service.dart';
 import 'package:room_reservation_expohack/services/firestore_server.dart';
@@ -200,6 +203,47 @@ class TagChip extends StatelessWidget {
   }
 }
 
+/* ───────────────────────── signatures ───────────────────────── */
+
+/// Who still has to sign a request (deans / librarian / GSO head / president).
+class SignatureChips extends StatelessWidget {
+  final Map<String, dynamic> b;
+  const SignatureChips(this.b, {super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final req = List<String>.from(b['required_signatories'] ?? const <String>[]);
+    final done = List<String>.from(b['approved_by'] ?? const <String>[]);
+    if (req.isEmpty) return const SizedBox.shrink();
+    final live = b['status'] == 'pending' || b['status'] == 'approved';
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      const Text('Required signatures', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: C.mut)),
+      const SizedBox(height: 5),
+      Wrap(spacing: 6, runSpacing: 6, children: [
+        for (final s in req)
+          StatusChip(done.contains(s) ? '$s ✓' : (live ? '$s · waiting' : s), done.contains(s) ? 'good' : (live ? 'warn' : 'bad')),
+      ]),
+    ]);
+  }
+}
+
+/* ───────────────────────── logo ───────────────────────── */
+
+/// UniSpace logo: [full] = mark + wordmark + tagline, otherwise the U-door mark only.
+class Logo extends StatelessWidget {
+  final double height;
+  final bool full;
+  const Logo({super.key, this.height = 38, this.full = false});
+
+  @override
+  Widget build(BuildContext context) => Image.asset(
+        full ? 'assets/images/unispace_logo.png' : 'assets/images/unispace_mark.png',
+        height: height,
+        fit: BoxFit.contain,
+        errorBuilder: (_, __, ___) => Icon(Icons.apartment_rounded, color: C.blue, size: height),
+      );
+}
+
 /* ───────────────────────── API (Firestore-backed) ───────────────────────── */
 
 class Api {
@@ -207,7 +251,9 @@ class Api {
   static Map<String, dynamic>? user;
   static final navKey = GlobalKey<NavigatorState>();
 
-  static bool get isAdmin => user?['role'] == 'admin';
+  static bool get isAdmin => user?['role'] == 'admin'; // handles rooms & bookings, never signs
+  static bool get isSignatory => user?['role'] == 'signatory'; // deans, librarian, GSO head, president
+  static String get signatory => (user?['signatory'] ?? '').toString();
 
   static Future<void> load() async {}
   static Future<void> save() async {}
@@ -230,28 +276,108 @@ class Api {
     }
   }
 
+  static String _ref(String id) => 'US-${(id.length > 8 ? id.substring(0, 8) : id).toUpperCase()}';
+
+  static String _time(Map<String, dynamic> b) => '${fmt(b['start_min'])} – ${fmt(b['end_min'])}';
+
+  /// Builds the request letter as an A4 PDF and either saves it or opens the print dialog.
+  static Future<void> _letterPdf(Map<String, dynamic> b, String id, {required bool print}) async {
+    // The built-in PDF fonts have no en dash, so the PDF uses a plain hyphen.
+    String t(String v) => v.replaceAll('–', '-');
+    final regular = pw.Font.times();
+    final bold = pw.Font.timesBold();
+    final base = pw.TextStyle(font: regular, fontSize: 12, lineSpacing: 4);
+    final strong = pw.TextStyle(font: bold, fontSize: 12, lineSpacing: 4);
+
+    pw.MemoryImage? mark;
+    try {
+      final d = await rootBundle.load('assets/images/unispace_mark.png');
+      mark = pw.MemoryImage(d.buffer.asUint8List(d.offsetInBytes, d.lengthInBytes));
+    } catch (_) {}
+
+    final doc = pw.Document(title: 'Request letter ${_ref(id)}', author: 'UniSpace');
+    doc.addPage(pw.Page(
+      pageFormat: PdfPageFormat.a4,
+      margin: const pw.EdgeInsets.fromLTRB(64, 64, 64, 64),
+      build: (_) => pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+        pw.Row(crossAxisAlignment: pw.CrossAxisAlignment.center, children: [
+          if (mark != null) pw.Image(mark!, height: 34),
+          if (mark != null) pw.SizedBox(width: 8),
+          pw.Text('UniSpace', style: pw.TextStyle(font: bold, fontSize: 16)),
+          pw.Spacer(),
+          pw.Text('Reference: ${_ref(id)}', style: base),
+        ]),
+        pw.Divider(thickness: 0.6),
+        pw.SizedBox(height: 10),
+        pw.SizedBox(height: 18),
+        pw.Text(todayLong(), style: base),
+        pw.SizedBox(height: 18),
+        pw.Text('${b['addressee']}', style: strong),
+        pw.Text('Iloilo Science and Technology University', style: base),
+        pw.SizedBox(height: 18),
+        pw.Text('Dear Sir/Madam:', style: base),
+        pw.SizedBox(height: 14),
+        pw.RichText(
+          text: pw.TextSpan(style: base, children: [
+            const pw.TextSpan(text: 'I respectfully request to use '),
+            pw.TextSpan(text: t('${b['room_name']} (${b['college']})'), style: strong),
+            const pw.TextSpan(text: ' on '),
+            pw.TextSpan(text: t('${longDate(b['date'])}, ${_time(b)}'), style: strong),
+            pw.TextSpan(
+                text: t(', for ${b['purpose']}, with approximately ${b['attendees']} attendees, '
+                    'under ${b['organization']}.')),
+          ]),
+        ),
+        pw.SizedBox(height: 14),
+        pw.Text('Your kind approval of this request will be highly appreciated. Thank you.', style: base),
+        pw.SizedBox(height: 22),
+        pw.Text('Respectfully yours,', style: base),
+        pw.SizedBox(height: 36),
+        pw.Text(t('${b['requester_name']}'), style: strong),
+        pw.Text(t('${b['organization']}'), style: base),
+      ]),
+    ));
+
+    if (print) {
+      await Printing.layoutPdf(name: 'UniSpace-${_ref(id)}.pdf', onLayout: (_) => doc.save());
+    } else {
+      await Printing.sharePdf(bytes: await doc.save(), filename: 'UniSpace-${_ref(id)}.pdf');
+    }
+  }
+
   static Future<void> openLetter(String id) async {
     final b = await FirestoreServer.bookingById(id);
     final ctx = navKey.currentContext;
     if (b == null || ctx == null || !ctx.mounted) return;
-    final ref = id.length > 8 ? id.substring(0, 8).toUpperCase() : id.toUpperCase();
-    final text = 'Reference: US-$ref\n\n'
+    final text = 'Reference: ${_ref(id)}\n\n'
         '${todayLong()}\n\n'
         '${b['addressee']}\nIloilo Science and Technology University\n\n'
         'Dear Sir/Madam:\n\n'
         'I respectfully request to use ${b['room_name']} (${b['college']}) on '
-        '${longDate(b['date'])}, ${fmt(b['start_min'])} – ${fmt(b['end_min'])}, for ${b['purpose']}, '
+        '${longDate(b['date'])}, ${_time(b)}, for ${b['purpose']}, '
         'with approximately ${b['attendees']} attendees, under ${b['organization']}.\n\n'
         'Your kind approval of this request will be highly appreciated. Thank you.\n\n'
         'Respectfully yours,\n\n${b['requester_name']}\n${b['organization']}';
     showDialog(
       context: ctx,
       builder: (c) => AlertDialog(
-        title: const Text('Request letter'),
+        title: const Text('Official Request Letter'),
         content: SingleChildScrollView(
           child: Text(text, style: const TextStyle(fontFamily: 'serif', height: 1.55, fontSize: 13.5)),
         ),
-        actions: [TextButton(onPressed: () => Navigator.pop(c), child: const Text('Close'))],
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c), child: const Text('Close')),
+          TextButton.icon(
+            onPressed: () => _letterPdf(b, id, print: true),
+            icon: const Icon(Icons.print_outlined, size: 18),
+            label: const Text('Print'),
+          ),
+          FilledButton.icon(
+            onPressed: () => _letterPdf(b, id, print: false),
+            icon: const Icon(Icons.download_rounded, size: 18),
+            label: const Text('Download PDF'),
+          ),
+        ],
       ),
     );
   }
@@ -263,8 +389,7 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   try {
-    final msg = await SeedService().seedInitialData();
-    debugPrint('SeedService: $msg');
+    debugPrint('SeedService: ${await SeedService().seedInitialData()}');
   } catch (e) {
     debugPrint('SeedService failed: $e');
   }
@@ -317,6 +442,11 @@ void goHome(BuildContext c) => Navigator.of(c).pushAndRemoveUntil(
 
 void goMine(BuildContext c, {bool admin = false}) => Navigator.of(c).pushAndRemoveUntil(
       MaterialPageRoute(builder: (_) => MyRequestsPage(admin: admin)),
+      (r) => r.isFirst,
+    );
+
+void goAdmin(BuildContext c) => Navigator.of(c).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const AdminPage()),
       (r) => r.isFirst,
     );
 
@@ -497,7 +627,8 @@ class Shell extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final wide = MediaQuery.of(context).size.width >= 820;
-    final name = (Api.user?['name'] ?? 'Guest').toString().split(' ').first;
+    final fullName = (Api.user?['name'] ?? 'Guest').toString();
+    final name = Api.isSignatory ? fullName : fullName.split(' ').first;
 
     Widget navItem(String id, String label, VoidCallback onTap) {
       final on = active == id;
@@ -530,12 +661,7 @@ class Shell extends StatelessWidget {
                   InkWell(
                     onTap: () => goHome(context),
                     child: Row(children: [
-                      Container(
-                        width: 36,
-                        height: 36,
-                        decoration: BoxDecoration(color: C.blue, borderRadius: BorderRadius.circular(10)),
-                        child: const Icon(Icons.apartment_rounded, color: Colors.white, size: 22),
-                      ),
+                      const Logo(height: 38),
                       const SizedBox(width: 10),
                       const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                         Text('UniSpace',
@@ -547,21 +673,24 @@ class Shell extends StatelessWidget {
                   const Spacer(),
                   if (wide) ...[
                     navItem('home', 'Home', () => goHome(context)),
-                    navItem('mine', 'My Requests', () => goMine(context)),
-                    if (Api.isAdmin) navItem('admin', 'Admin', () => goMine(context, admin: true)),
+                    if (Api.isAdmin || Api.isSignatory)
+                      navItem('admin', Api.isAdmin ? 'Admin Console' : 'Approvals', () => goAdmin(context))
+                    else
+                      navItem('mine', 'My Requests', () => goMine(context)),
                     const SizedBox(width: 16),
                   ],
                   PopupMenuButton<String>(
                     onSelected: (v) {
                       if (v == 'home') goHome(context);
                       if (v == 'mine') goMine(context);
-                      if (v == 'admin') goMine(context, admin: true);
+                      if (v == 'admin') goAdmin(context);
                       if (v == 'out') Api.logout();
                     },
                     itemBuilder: (_) => [
                       if (!wide) const PopupMenuItem(value: 'home', child: Text('Home')),
-                      if (!wide) const PopupMenuItem(value: 'mine', child: Text('My Requests')),
-                      if (!wide && Api.isAdmin) const PopupMenuItem(value: 'admin', child: Text('Admin')),
+                      if (!wide && !Api.isAdmin && !Api.isSignatory) const PopupMenuItem(value: 'mine', child: Text('My Requests')),
+                      if (!wide && (Api.isAdmin || Api.isSignatory))
+                        PopupMenuItem(value: 'admin', child: Text(Api.isAdmin ? 'Admin Console' : 'Approvals')),
                       const PopupMenuItem(value: 'out', child: Text('Sign out')),
                     ],
                     child: Container(
@@ -600,12 +729,16 @@ class _LoginPageState extends State<LoginPage> {
   String? error;
   bool busy = false;
 
-  Future<void> _login() async {
+  Future<void> _login([String? preset]) async {
+    if (preset != null) {
+      user.text = preset;
+      pass.text = preset;
+    }
     setState(() {
       busy = true;
       error = null;
     });
-    final r = await Api.call('POST', '/login', body: {'username': user.text, 'password': pass.text});
+    final r = await Api.call('POST', '/login', body: {'username': user.text.trim(), 'password': pass.text.trim()});
     if (!mounted) return;
     if (!r.ok) {
       setState(() {
@@ -618,7 +751,14 @@ class _LoginPageState extends State<LoginPage> {
     Api.user = Map<String, dynamic>.from(r.data['user']);
     await Api.save();
     if (!mounted) return;
-    goHome(context);
+    if (Api.isAdmin || Api.isSignatory) {
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const AdminPage()),
+        (route) => false,
+      );
+    } else {
+      goHome(context);
+    }
   }
 
   @override
@@ -641,17 +781,7 @@ class _LoginPageState extends State<LoginPage> {
                 padding: const EdgeInsets.all(24),
                 decoration: cardDeco(radius: 24),
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-                  Row(children: [
-                    Container(
-                      width: 42,
-                      height: 42,
-                      decoration: BoxDecoration(color: C.blue, borderRadius: BorderRadius.circular(12)),
-                      child: const Icon(Icons.apartment_rounded, color: Colors.white),
-                    ),
-                    const SizedBox(width: 12),
-                    const Text('UniSpace',
-                        style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: C.navy)),
-                  ]),
+                  const Center(child: Logo(height: 160, full: true)),
                   const SizedBox(height: 22),
                   const Text('Sign in', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800)),
                   const SizedBox(height: 4),
@@ -673,9 +803,20 @@ class _LoginPageState extends State<LoginPage> {
                   if (error != null) Alert(error!, 'bad'),
                   const SizedBox(height: 14),
                   SizedBox(width: double.infinity, child: Btn('Sign in', onTap: _login, busy: busy)),
-                  const SizedBox(height: 12),
-                  const Text('Demo: student / student · student2 / student2 · admin / admin',
-                      style: TextStyle(fontSize: 12, color: C.mut)),
+                  const SizedBox(height: 16),
+                  const Text('Quick demo accounts (1-tap sign in) · other usernames: coe_dean, cit_dean, cgbe_dean · password = username',
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: C.mut)),
+                  const SizedBox(height: 8),
+                  Wrap(spacing: 8, runSpacing: 8, children: [
+                    Btn('Student 1', small: true, outlined: true, onTap: () => _login('student')),
+                    Btn('Student 2', small: true, outlined: true, onTap: () => _login('student2')),
+                    Btn('Room Admin', small: true, outlined: true, onTap: () => _login('admin')),
+                    Btn('CCI Dean', small: true, outlined: true, onTap: () => _login('cci_dean')),
+                    Btn('CEA Dean', small: true, outlined: true, onTap: () => _login('cea_dean')),
+                    Btn('Librarian', small: true, outlined: true, onTap: () => _login('librarian')),
+                    Btn('GSO Head', small: true, outlined: true, onTap: () => _login('gso')),
+                    Btn('President', small: true, outlined: true, onTap: () => _login('president')),
+                  ]),
                 ]),
               ),
             ),
@@ -1064,7 +1205,7 @@ class _HomePageState extends State<HomePage> {
               const SizedBox(height: 2),
               Text('${c['rooms']} rooms & facilities', style: const TextStyle(fontSize: 12, color: C.mut)),
               const SizedBox(height: 2),
-              Text('Open 8:00 AM – 5:00 PM',
+              Text('Open ${fmt(kOpen)} – ${fmt(kClose)}',
                   style: TextStyle(fontSize: 11.5, color: accentFor(code), fontWeight: FontWeight.w700)),
             ]),
           ),
@@ -1159,12 +1300,12 @@ class _HomePageState extends State<HomePage> {
         Container(
           padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(color: Colors.white.withAlpha(190), borderRadius: BorderRadius.circular(16)),
-          child: const Row(children: [
-            Icon(Icons.school_rounded, color: C.blue),
-            SizedBox(width: 10),
+          child: Row(children: [
+            const Icon(Icons.school_rounded, color: C.blue),
+            const SizedBox(width: 10),
             Expanded(
-              child: Text('Iloilo Science and Technology University · 30-minute slots · 8:00 AM – 5:00 PM',
-                  style: TextStyle(fontSize: 12.5, color: C.mut, fontWeight: FontWeight.w600)),
+              child: Text('Iloilo Science and Technology University · 30-minute slots · ${fmt(kOpen)} – ${fmt(kClose)}',
+                  style: const TextStyle(fontSize: 12.5, color: C.mut, fontWeight: FontWeight.w600)),
             ),
           ]),
         ),
@@ -1313,7 +1454,7 @@ class _RoomsPageState extends State<RoomsPage> {
   }
 }
 
-/* ───────────────────────── room calendar + slots ───────────────────────── */
+/* ───────────────────────── room: calendar + schedule + booking form + letter ───────────────────────── */
 
 class RoomPage extends StatefulWidget {
   final String roomId;
@@ -1327,16 +1468,28 @@ class RoomPage extends StatefulWidget {
 }
 
 class _RoomPageState extends State<RoomPage> {
+  late String roomId = widget.roomId;
   Map<String, dynamic>? room;
   Color get accent => accentFor((room?['code'] ?? '').toString());
   late DateTime month;
   Map<String, dynamic> status = {};
   String? pickDate;
-  int? start;
-  int? end;
-  List<List<int>> busy = [];
+  late int start = widget.start ?? 9 * 60;
+  late int end = widget.end ?? (widget.start ?? 9 * 60) + 60;
+  List<Map<String, dynamic>> busyList = [];
+  List<List<int>> freeList = [];
   bool loadingDay = false;
   String? error;
+
+  Map<String, dynamic>? suggestions;
+  String? formError;
+  bool submitting = false;
+  bool fromSuggestion = false;
+
+  late final name = TextEditingController(text: (Api.user?['name'] ?? '').toString());
+  final org = TextEditingController(text: 'ISATU Student Organization');
+  final purpose = TextEditingController(text: 'Club Assembly & Planning');
+  final att = TextEditingController(text: '25');
 
   @override
   void initState() {
@@ -1344,13 +1497,22 @@ class _RoomPageState extends State<RoomPage> {
     final d = widget.date ?? DateTime.now();
     month = DateTime(d.year, d.month, 1);
     if (widget.date != null) pickDate = iso(widget.date!);
-    start = widget.start;
-    end = widget.end;
+    for (final c in [name, org, purpose, att]) {
+      c.addListener(() => setState(() {}));
+    }
     _init();
   }
 
+  @override
+  void dispose() {
+    for (final c in [name, org, purpose, att]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
   Future<void> _init() async {
-    final r = await Api.call('GET', '/rooms/${widget.roomId}');
+    final r = await Api.call('GET', '/rooms/$roomId');
     if (!mounted) return;
     if (!r.ok) {
       setState(() => error = r.error);
@@ -1363,7 +1525,7 @@ class _RoomPageState extends State<RoomPage> {
 
   Future<void> _loadCal() async {
     final m = '${month.year}-${pad(month.month)}';
-    final r = await Api.call('GET', '/rooms/${widget.roomId}/calendar?month=$m');
+    final r = await Api.call('GET', '/rooms/$roomId/calendar?month=$m');
     if (!mounted) return;
     setState(() => status = r.data is Map ? Map<String, dynamic>.from(r.data) : {});
   }
@@ -1371,26 +1533,16 @@ class _RoomPageState extends State<RoomPage> {
   Future<void> _loadDay() async {
     if (pickDate == null) return;
     setState(() => loadingDay = true);
-    final r = await Api.call('GET', '/rooms/${widget.roomId}/day?date=$pickDate');
+    final r = await Api.call('GET', '/rooms/$roomId/day?date=$pickDate');
     if (!mounted) return;
-    final list = <List<int>>[];
-    if (r.data is Map) {
-      for (final b in (r.data['busy'] as List)) {
-        list.add([b['start_min'] as int, b['end_min'] as int]);
-      }
-    }
     setState(() {
-      busy = list;
       loadingDay = false;
-      if (start != null && end != null && _rangeBusy(start!, end!)) {
-        start = null;
-        end = null;
+      if (r.data is Map) {
+        busyList = List<Map<String, dynamic>>.from((r.data['busy'] as List).map((e) => Map<String, dynamic>.from(e)));
+        freeList = [for (final w in (r.data['free'] as List)) [w[0] as int, w[1] as int]];
       }
     });
   }
-
-  bool _rangeBusy(int a, int b) => busy.any((x) => a < x[1] && b > x[0]);
-  bool _slotBusy(int s) => _rangeBusy(s, s + kStep);
 
   void _shiftMonth(int n) {
     setState(() => month = DateTime(month.year, month.month + n, 1));
@@ -1400,25 +1552,75 @@ class _RoomPageState extends State<RoomPage> {
   void _pickDay(String ds) {
     setState(() {
       pickDate = ds;
-      start = null;
-      end = null;
+      suggestions = null;
+      formError = null;
     });
     _loadDay();
   }
 
-  void _tapSlot(int s) {
+  Future<void> _submit() async {
+    if (pickDate == null) return;
     setState(() {
-      if (start == null || end != null || s < start!) {
-        start = s;
-        end = null;
-      } else if (_rangeBusy(start!, s + kStep)) {
-        start = s;
-        end = null;
-      } else {
-        end = s + kStep;
+      submitting = true;
+      formError = null;
+      suggestions = null;
+    });
+    final r = await Api.call('POST', '/bookings', body: {
+      'room_id': room!['id'],
+      'date': pickDate,
+      'start_min': start,
+      'end_min': end,
+      'requester_name': name.text,
+      'organization': org.text,
+      'purpose': purpose.text,
+      'attendees': int.tryParse(att.text.trim()) ?? 0,
+      'from_suggestion': fromSuggestion,
+    });
+    if (!mounted) return;
+    if (r.status == 201) {
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const MyRequestsPage(justSent: true)),
+        (route) => route.isFirst,
+      );
+      return;
+    }
+    setState(() {
+      submitting = false;
+      fromSuggestion = false;
+      formError = r.error;
+      if (r.status == 409 && r.data is Map) {
+        suggestions = Map<String, dynamic>.from(r.data['suggestions'] ?? {});
       }
     });
   }
+
+  void _applyTime(int s, int e) {
+    setState(() {
+      start = s;
+      end = e;
+      fromSuggestion = true;
+      formError = null;
+      suggestions = null;
+    });
+    _submit();
+  }
+
+  Future<void> _applyRoom(String id) async {
+    final r = await Api.call('GET', '/rooms/$id');
+    if (!mounted || !r.ok) return;
+    setState(() {
+      room = Map<String, dynamic>.from(r.data);
+      roomId = id;
+      fromSuggestion = true;
+      formError = null;
+      suggestions = null;
+    });
+    await _loadCal();
+    await _loadDay();
+    _submit();
+  }
+
+  /* ── calendar ── */
 
   Widget _cell(int d, String today) {
     final ds = '${month.year}-${pad(month.month)}-${pad(d)}';
@@ -1500,195 +1702,206 @@ class _RoomPageState extends State<RoomPage> {
     );
   }
 
-  Widget _slotsPanel() {
-    final ready = start != null && end != null;
+  /* ── schedule (open windows + booked / pending events) ── */
+
+  Widget _schedulePanel() {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: cardDeco(),
-      child: pickDate == null
-          ? const Padding(
-              padding: EdgeInsets.symmetric(vertical: 24),
-              child: Center(child: Text('Pick a day to see the time slots.', style: TextStyle(color: C.mut))),
-            )
-          : Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(longDate(pickDate!), style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
-              const SizedBox(height: 4),
-              const Text('Tap a start time, then tap the last slot you need.',
-                  style: TextStyle(fontSize: 12, color: C.mut)),
-              const SizedBox(height: 12),
-              if (loadingDay)
-                const Loading()
-              else
-                GridView.count(
-                  crossAxisCount: 3,
-                  shrinkWrap: true,
-                  physics: const NeverScrollableScrollPhysics(),
-                  mainAxisSpacing: 8,
-                  crossAxisSpacing: 8,
-                  childAspectRatio: 2.1,
-                  children: [
-                    for (var s = kOpen; s < kClose; s += kStep) _slot(s),
-                  ],
-                ),
-              if (ready) Alert('${fmt(start!)} – ${fmt(end!)}', 'good'),
-              const SizedBox(height: 8),
-              SizedBox(
-                width: double.infinity,
-                child: Btn('Book now',
-                    icon: Icons.event_available_rounded,
-                    onTap: ready
-                        ? () => Navigator.of(context).push(MaterialPageRoute(
-                              builder: (_) => BookingFormPage(room: room!, date: pickDate!, start: start!, end: end!),
-                            ))
-                        : null),
-              ),
-            ]),
-    );
-  }
-
-  Widget _slot(int s) {
-    final b = _slotBusy(s);
-    final sel = start != null && s >= start! && s < (end ?? start! + kStep);
-    return InkWell(
-      borderRadius: BorderRadius.circular(10),
-      onTap: b ? null : () => _tapSlot(s),
-      child: Container(
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: sel ? accent : b ? C.busy : Colors.white,
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: sel ? accent : b ? C.busy : C.line),
-        ),
-        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-          Text(fmt(s),
-              style: TextStyle(
-                  fontSize: 12.5,
-                  fontWeight: FontWeight.w700,
-                  color: sel ? Colors.white : b ? C.busyInk : C.ink)),
-          if (b) const Text('booked', style: TextStyle(fontSize: 10, color: C.busyInk)),
-        ]),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final wide = MediaQuery.of(context).size.width >= 900;
-    return Shell(
-      child: PageBody(children: [
-        const Crumb('Back to rooms'),
-        if (error != null)
-          Alert(error!, 'bad')
-        else if (room == null)
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('Schedule · ${shortDate(pickDate!)}',
+            style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: C.navy)),
+        const SizedBox(height: 10),
+        if (loadingDay)
           const Loading()
         else ...[
-          HeaderBanner(
-            code: (room!['code'] ?? '').toString(),
-            icon: kindIcon(room!['kind'].toString()),
-            title: room!['name'].toString(),
-            subtitle: '${room!['college']} · ${room!['kind']} · capacity ${room!['capacity']}',
-          ),
-          const SizedBox(height: 16),
-          if (wide)
-            Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Expanded(child: _calendarPanel()),
-              const SizedBox(width: 16),
-              Expanded(child: _slotsPanel()),
-            ])
-          else ...[
-            _calendarPanel(),
-            const SizedBox(height: 16),
-            _slotsPanel(),
-          ],
+          const Text('Open Windows:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: C.mut)),
+          const SizedBox(height: 6),
+          if (freeList.isEmpty)
+            const StatusChip('No free windows on this date', 'bad')
+          else
+            Wrap(spacing: 8, runSpacing: 8, children: [
+              for (final w in freeList)
+                ActionChip(
+                  backgroundColor: C.free,
+                  side: BorderSide.none,
+                  label: Text('${fmt(w[0])} – ${fmt(w[1])}',
+                      style: const TextStyle(color: C.freeInk, fontWeight: FontWeight.w700, fontSize: 12)),
+                  onPressed: () => setState(() {
+                    start = w[0];
+                    end = (w[0] + 60 <= w[1]) ? w[0] + 60 : w[1];
+                    formError = null;
+                    suggestions = null;
+                  }),
+                ),
+            ]),
+          const SizedBox(height: 12),
+          const Text('Occupied / Pending Slots:',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: C.mut)),
+          const SizedBox(height: 6),
+          if (busyList.isEmpty)
+            const Text('No events booked for this day yet.', style: TextStyle(fontSize: 12.5, color: C.mut))
+          else
+            for (final b in busyList)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Row(children: [
+                  StatusChip(b['status'] == 'approved' ? 'Approved' : 'Pending',
+                      b['status'] == 'approved' ? 'bad' : 'warn'),
+                  const SizedBox(width: 8),
+                  Text('${fmt(b['start_min'] as int)} – ${fmt(b['end_min'] as int)}',
+                      style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text('(${b['purpose']})',
+                        overflow: TextOverflow.ellipsis, style: const TextStyle(color: C.mut, fontSize: 12.5)),
+                  ),
+                ]),
+              ),
         ],
       ]),
     );
   }
-}
 
-/* ───────────────────────── booking form + letter preview ───────────────────────── */
+  /* ── smart conflict resolver ── */
 
-class BookingFormPage extends StatefulWidget {
-  final Map<String, dynamic> room;
-  final String date;
-  final int start;
-  final int end;
-  const BookingFormPage({super.key, required this.room, required this.date, required this.start, required this.end});
-
-  @override
-  State<BookingFormPage> createState() => _BookingFormPageState();
-}
-
-class _BookingFormPageState extends State<BookingFormPage> {
-  late Map<String, dynamic> room = widget.room;
-  late int start = widget.start;
-  late int end = widget.end;
-  late final name = TextEditingController(text: (Api.user?['name'] ?? '').toString());
-  final org = TextEditingController();
-  final purpose = TextEditingController();
-  final att = TextEditingController();
-  String? error;
-  Map<String, dynamic>? suggestions;
-  bool busy = false;
-
-  @override
-  void initState() {
-    super.initState();
-    for (final c in [name, org, purpose, att]) {
-      c.addListener(() => setState(() {}));
-    }
+  Widget _suggestionsPanel() {
+    final s = suggestions!;
+    final same = s['sameRoom'] as Map<String, dynamic>?;
+    final blocked = s['blockedBy'] as Map<String, dynamic>?;
+    final others = (s['otherRooms'] as List? ?? []).cast<Map<String, dynamic>>();
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(top: 4, bottom: 12),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: C.blue, width: 1.5),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Row(children: [
+          Icon(Icons.auto_awesome_rounded, color: C.blue, size: 20),
+          SizedBox(width: 8),
+          Expanded(
+            child: Text('Smart Conflict Resolver (1-Tap Fix)',
+                style: TextStyle(fontWeight: FontWeight.w800, fontSize: 14, color: C.navy)),
+          ),
+        ]),
+        if (blocked != null) ...[
+          const SizedBox(height: 6),
+          Text(
+            'Blocked by ${blocked['status']} booking '
+            '(${fmt(blocked['start_min'] as int)} – ${fmt(blocked['end_min'] as int)}: ${blocked['purpose']}).',
+            style: const TextStyle(fontSize: 12.5, color: C.mut),
+          ),
+        ],
+        const SizedBox(height: 12),
+        if (same != null) ...[
+          const Text('Nearest free time in this room:',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+          const SizedBox(height: 6),
+          ActionChip(
+            avatar: const Icon(Icons.schedule_rounded, size: 16, color: C.blue),
+            backgroundColor: C.tint,
+            side: BorderSide.none,
+            label: Text('Book ${fmt(same['start_min'] as int)} – ${fmt(same['end_min'] as int)} here',
+                style: const TextStyle(fontWeight: FontWeight.w800, color: C.blue)),
+            onPressed: () => _applyTime(same['start_min'] as int, same['end_min'] as int),
+          ),
+          const SizedBox(height: 10),
+        ],
+        if (others.isNotEmpty) ...[
+          const Text('Capacity-ranked rooms free at your exact time:',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+          const SizedBox(height: 6),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+            for (final o in others)
+              ActionChip(
+                avatar: const Icon(Icons.meeting_room_rounded, size: 16, color: C.freeInk),
+                backgroundColor: C.free,
+                side: BorderSide.none,
+                label: Text('${o['name']} (${o['fit_label']})',
+                    style: const TextStyle(fontWeight: FontWeight.w800, color: C.freeInk, fontSize: 12.5)),
+                onPressed: () => _applyRoom(o['id'].toString()),
+              ),
+          ]),
+        ] else if (same == null)
+          const Text('No rooms in this college fit your attendee count at this slot. Try another date.',
+              style: TextStyle(fontSize: 12.5, color: C.mut)),
+      ]),
+    );
   }
 
-  @override
-  void dispose() {
-    for (final c in [name, org, purpose, att]) {
-      c.dispose();
-    }
-    super.dispose();
+  /* ── request reservation form ── */
+
+  Widget _formPanel() {
+    final times = <int>[for (var t = kOpen; t <= kClose; t += kStep) t];
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: cardDeco(),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        const Text('Request Reservation',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: C.navy)),
+        const SizedBox(height: 14),
+        Row(children: [
+          Expanded(
+            child: DropdownButtonFormField<int>(
+              value: start,
+              decoration: const InputDecoration(labelText: 'Start Time'),
+              items: [for (final t in times.where((t) => t < kClose)) DropdownMenuItem(value: t, child: Text(fmt(t)))],
+              onChanged: (v) {
+                if (v != null) {
+                  setState(() {
+                    start = v;
+                    if (end <= start) end = start + kStep;
+                  });
+                }
+              },
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: DropdownButtonFormField<int>(
+              value: end,
+              decoration: const InputDecoration(labelText: 'End Time'),
+              items: [for (final t in times.where((t) => t > start)) DropdownMenuItem(value: t, child: Text(fmt(t)))],
+              onChanged: (v) {
+                if (v != null) setState(() => end = v);
+              },
+            ),
+          ),
+        ]),
+        const SizedBox(height: 12),
+        TextField(controller: name, decoration: const InputDecoration(labelText: 'Requester Full Name')),
+        const SizedBox(height: 12),
+        TextField(controller: org, decoration: const InputDecoration(labelText: 'College / Student Organization')),
+        const SizedBox(height: 12),
+        Row(children: [
+          Expanded(
+            flex: 2,
+            child: TextField(controller: purpose, decoration: const InputDecoration(labelText: 'Activity / Purpose')),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: TextField(
+              controller: att,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: 'Attendees'),
+            ),
+          ),
+        ]),
+        const SizedBox(height: 6),
+        if (formError != null) Alert(formError!, 'bad'),
+        if (suggestions != null) _suggestionsPanel(),
+        const SizedBox(height: 12),
+        Btn('Submit Booking Request',
+            icon: Icons.check_circle_outline_rounded, busy: submitting, onTap: _submit),
+      ]),
+    );
   }
 
-  Future<void> _submit() async {
-    setState(() {
-      busy = true;
-      error = null;
-      suggestions = null;
-    });
-    final r = await Api.call('POST', '/bookings', body: {
-      'room_id': room['id'],
-      'date': widget.date,
-      'start_min': start,
-      'end_min': end,
-      'requester_name': name.text,
-      'organization': org.text,
-      'purpose': purpose.text,
-      'attendees': int.tryParse(att.text.trim()) ?? 0,
-    });
-    if (!mounted) return;
-    if (r.status == 201) {
-      Navigator.of(context).pushAndRemoveUntil(
-        MaterialPageRoute(builder: (_) => const MyRequestsPage(justSent: true)),
-        (route) => route.isFirst,
-      );
-      return;
-    }
-    setState(() {
-      busy = false;
-      if (r.status == 409 && r.data is Map) {
-        suggestions = Map<String, dynamic>.from(r.data['suggestions'] ?? {});
-      } else {
-        error = r.error;
-      }
-    });
-  }
-
-  Future<void> _useRoom(String id) async {
-    final r = await Api.call('GET', '/rooms/$id');
-    if (!mounted || !r.ok) return;
-    setState(() {
-      room = Map<String, dynamic>.from(r.data);
-      suggestions = null;
-    });
-  }
+  /* ── letter preview (fills in as you type) ── */
 
   InlineSpan _ph(String v, String p) => v.trim().isNotEmpty
       ? TextSpan(text: v.trim(), style: const TextStyle(fontWeight: FontWeight.w700))
@@ -1713,12 +1926,12 @@ class _BookingFormPageState extends State<BookingFormPage> {
           style: const TextStyle(fontFamily: 'serif', fontSize: 13.5, height: 1.6, color: Colors.black),
           children: [
             TextSpan(text: '${todayLong()}\n\n'),
-            TextSpan(text: '${room['addressee']}\nIloilo Science and Technology University\n\n'),
+            TextSpan(text: '${room!['addressee']}\nIloilo Science and Technology University\n\n'),
             const TextSpan(text: 'Dear Sir/Madam:\n\n'),
             const TextSpan(text: 'I respectfully request to use '),
-            TextSpan(text: '${room['name']} (${room['college']})', style: b),
+            TextSpan(text: '${room!['name']} (${room!['college']})', style: b),
             const TextSpan(text: ' on '),
-            TextSpan(text: '${longDate(widget.date)}, ${fmt(start)} – ${fmt(end)}', style: b),
+            TextSpan(text: '${longDate(pickDate!)}, ${fmt(start)} – ${fmt(end)}', style: b),
             const TextSpan(text: ', for '),
             _ph(purpose.text, 'purpose'),
             const TextSpan(text: ', with approximately '),
@@ -1735,92 +1948,55 @@ class _BookingFormPageState extends State<BookingFormPage> {
     );
   }
 
-  Widget _suggestions() {
-    final s = suggestions!;
-    final same = s['sameRoom'] as Map<String, dynamic>?;
-    final others = (s['otherRooms'] as List? ?? []).cast<Map<String, dynamic>>();
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.only(top: 12),
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(color: C.pend, borderRadius: BorderRadius.circular(14)),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text('Conflict blocked. ${fmt(start)} – ${fmt(end)} is already taken.',
-            style: const TextStyle(color: C.pendInk, fontWeight: FontWeight.w800, fontSize: 13)),
-        const SizedBox(height: 10),
-        if (same != null)
-          Btn('Use nearest free slot: ${fmt(same['start_min'] as int)} – ${fmt(same['end_min'] as int)}',
-              small: true,
-              onTap: () => setState(() {
-                    start = same['start_min'] as int;
-                    end = same['end_min'] as int;
-                    suggestions = null;
-                  }))
-        else
-          const Text('No other free slot of that length today in this room.',
-              style: TextStyle(color: C.pendInk, fontSize: 13)),
-        for (final o in others) ...[
-          const SizedBox(height: 8),
-          Btn('Same time in ${o['name']}', small: true, outlined: true, onTap: () => _useRoom(o['id'].toString())),
-        ],
-      ]),
-    );
-  }
-
-  Widget _formPanel() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: cardDeco(),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        TextField(controller: name, decoration: const InputDecoration(labelText: 'Full name *')),
-        const SizedBox(height: 12),
-        TextField(controller: org, decoration: const InputDecoration(labelText: 'Organization / department *')),
-        const SizedBox(height: 12),
-        TextField(controller: purpose, decoration: const InputDecoration(labelText: 'Purpose of use *')),
-        const SizedBox(height: 12),
-        TextField(
-          controller: att,
-          keyboardType: TextInputType.number,
-          decoration: InputDecoration(labelText: 'Number of attendees * (max ${room['capacity']})'),
+  Widget _letterSection() => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Padding(
+          padding: EdgeInsets.only(bottom: 8),
+          child: Text('LETTER PREVIEW — fills in as you type',
+              style: TextStyle(fontSize: 11, color: C.mut, fontWeight: FontWeight.w700, letterSpacing: .6)),
         ),
-        if (error != null) Alert(error!, 'bad'),
-        if (suggestions != null) _suggestions(),
-        const SizedBox(height: 16),
-        SizedBox(
-          width: double.infinity,
-          child: Btn('Generate letter and submit', icon: Icons.send_rounded, onTap: _submit, busy: busy),
-        ),
-      ]),
-    );
-  }
+        _letter(),
+      ]);
 
   @override
   Widget build(BuildContext context) {
     final wide = MediaQuery.of(context).size.width >= 900;
-    final preview = Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      const Padding(
-        padding: EdgeInsets.only(bottom: 8),
-        child: Text('LETTER PREVIEW — fills in as you type',
-            style: TextStyle(fontSize: 11, color: C.mut, fontWeight: FontWeight.w700, letterSpacing: .6)),
-      ),
-      _letter(),
-    ]);
+    final right = pickDate == null
+        ? Container(
+            padding: const EdgeInsets.symmetric(vertical: 36, horizontal: 16),
+            decoration: cardDeco(),
+            child: const Center(
+              child: Text('Pick a day on the calendar to see what is booked and to request this room.',
+                  textAlign: TextAlign.center, style: TextStyle(color: C.mut)),
+            ),
+          )
+        : Column(children: [_schedulePanel(), const SizedBox(height: 16), _formPanel()]);
     return Shell(
       child: PageBody(children: [
-        const Crumb('Back to calendar'),
-        const Text('Complete your request', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800)),
-        Alert('${room['name']} · ${room['college']} · ${longDate(widget.date)} · ${fmt(start)} – ${fmt(end)}', 'good'),
-        const SizedBox(height: 8),
-        if (wide)
-          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Expanded(child: _formPanel()),
-            const SizedBox(width: 16),
-            Expanded(child: preview),
-          ])
+        const Crumb('Back to rooms'),
+        if (error != null)
+          Alert(error!, 'bad')
+        else if (room == null)
+          const Loading()
         else ...[
-          _formPanel(),
+          HeaderBanner(
+            code: (room!['code'] ?? '').toString(),
+            icon: kindIcon(room!['kind'].toString()),
+            title: room!['name'].toString(),
+            subtitle: '${room!['college']} · ${room!['kind']} · Capacity: ${room!['capacity']} people',
+          ),
           const SizedBox(height: 16),
-          preview,
+          if (wide)
+            Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Expanded(child: _calendarPanel()),
+              const SizedBox(width: 16),
+              Expanded(child: right),
+            ])
+          else ...[
+            _calendarPanel(),
+            const SizedBox(height: 16),
+            right,
+          ],
+          if (pickDate != null) ...[const SizedBox(height: 16), _letterSection()],
         ],
       ]),
     );
@@ -1863,11 +2039,6 @@ class _MyRequestsPageState extends State<MyRequestsPage> {
     });
   }
 
-  Future<void> _decide(String id, String status) async {
-    await Api.call('PATCH', '/bookings/$id', body: {'status': status});
-    _load();
-  }
-
   Future<void> _reset() async {
     final ok = await showDialog<bool>(
       context: context,
@@ -1890,10 +2061,23 @@ class _MyRequestsPageState extends State<MyRequestsPage> {
     final st = b['status'].toString();
     final kind = st == 'approved' ? 'good' : st == 'pending' ? 'warn' : 'bad';
     final id = b['id'].toString();
+    final nearCap = b['near_capacity'] == true;
+    final contention = b['has_contention'] == true;
+    final ac = accentFor((b['code'] ?? '').toString());
     return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: cardDeco(),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      decoration: BoxDecoration(
+        color: Color.alphaBlend(ac.withAlpha(16), Colors.white),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: ac.withAlpha(90)),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: IntrinsicHeight(
+        child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Container(width: 7, color: ac),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Container(
             width: 44,
@@ -1907,7 +2091,7 @@ class _MyRequestsPageState extends State<MyRequestsPage> {
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text(b['room_name'].toString(), style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
               Text('${b['college']}${widget.admin ? ' · ${b['requester_name']}' : ''}',
-                  style: const TextStyle(color: C.mut, fontSize: 12.5)),
+                  style: TextStyle(color: ac, fontWeight: FontWeight.w700, fontSize: 12.5)),
             ]),
           ),
           StatusChip(st, kind),
@@ -1923,15 +2107,30 @@ class _MyRequestsPageState extends State<MyRequestsPage> {
           Text('${fmt(b['start_min'] as int)} – ${fmt(b['end_min'] as int)}',
               style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
         ]),
+        const SizedBox(height: 10),
+        Text(
+          '${b['purpose']} · ${b['organization']} (${b['requester_name']}) · '
+          '${b['attendees']}/${b['room_capacity']} pax',
+          style: const TextStyle(fontSize: 12.5, color: C.mut),
+        ),
+        const SizedBox(height: 10),
+        SignatureChips(b),
+        if (widget.admin && (nearCap || contention)) ...[
+          const SizedBox(height: 8),
+          Wrap(spacing: 6, runSpacing: 6, children: [
+            if (nearCap) const StatusChip('Near Capacity (>=85%)', 'warn'),
+            if (contention) const StatusChip('Slot Contention Alert', 'bad'),
+          ]),
+        ],
         const SizedBox(height: 14),
         Wrap(spacing: 8, runSpacing: 8, children: [
-          if (widget.admin && st == 'pending') ...[
-            Btn('Approve', small: true, icon: Icons.check_rounded, onTap: () => _decide(id, 'approved')),
-            Btn('Reject', small: true, outlined: true, icon: Icons.close_rounded, onTap: () => _decide(id, 'rejected')),
-          ],
           Btn('Letter', small: true, outlined: true, icon: Icons.picture_as_pdf_outlined, onTap: () => Api.openLetter(id)),
         ]),
       ]),
+            ),
+          ),
+        ]),
+      ),
     );
   }
 
@@ -1956,10 +2155,603 @@ class _MyRequestsPageState extends State<MyRequestsPage> {
             child: Center(child: Text('Nothing here yet.', style: TextStyle(color: C.mut))),
           )
         else
-          RGrid(minW: 340, children: [for (final b in list) _card(b)]),
+          Column(children: [for (final b in list) Padding(padding: const EdgeInsets.only(bottom: 12), child: _card(b))]),
         if (widget.admin) ...[
           const SizedBox(height: 20),
           Align(alignment: Alignment.centerLeft, child: Btn('Reset demo data', small: true, outlined: true, onTap: _reset)),
+        ],
+      ]),
+    );
+  }
+}
+
+/* ───────────────────────── admin console ───────────────────────── */
+
+String bldName(String code) {
+  switch (code) {
+    case 'MEC':
+      return 'Gym';
+    case 'GRAND':
+      return 'Grandstand';
+    default:
+      return buildingLabel(code);
+  }
+}
+
+class AdminPage extends StatefulWidget {
+  const AdminPage({super.key});
+  @override
+  State<AdminPage> createState() => _AdminPageState();
+}
+
+class _AdminPageState extends State<AdminPage> {
+  List<Map<String, dynamic>> all = [];
+  Map<String, dynamic>? stats;
+  bool loading = true;
+  String? error;
+  String tab = 'pending';
+  String bld = 'ALL';
+  DateTime month = DateTime(DateTime.now().year, DateTime.now().month, 1);
+  String? pickDay;
+  final search = TextEditingController();
+
+  static const _codes = ['ALL', 'CEA', 'CCI', 'COE', 'CIT', 'CGBE', 'LIB', 'MEC', 'GRAND'];
+
+  @override
+  void initState() {
+    super.initState();
+    search.addListener(() => setState(() {}));
+    _load();
+  }
+
+  @override
+  void dispose() {
+    search.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    final rs = await Future.wait([Api.call('GET', '/bookings'), Api.call('GET', '/stats')]);
+    if (!mounted) return;
+    setState(() {
+      loading = false;
+      if (rs[0].ok) {
+        all = List<Map<String, dynamic>>.from(rs[0].data as List);
+        error = null;
+      } else {
+        error = rs[0].error;
+      }
+      stats = rs[1].ok ? Map<String, dynamic>.from(rs[1].data as Map) : null;
+    });
+  }
+
+  int _count(String st) => st == 'all' ? all.length : all.where((b) => b['status'] == st).length;
+
+  List<Map<String, dynamic>> get _filtered {
+    final q = search.text.trim().toLowerCase();
+    return all.where((b) {
+      if (tab != 'all' && b['status'] != tab) return false;
+      if (bld != 'ALL' && b['code'] != bld) return false;
+      if (pickDay != null && b['date'] != pickDay) return false;
+      if (q.isEmpty) return true;
+      final hay = '${b['requester_name']} ${b['purpose']} ${b['room_name']} ${b['organization']}'.toLowerCase();
+      return hay.contains(q);
+    }).toList();
+  }
+
+  bool _iSigned(Map<String, dynamic> b) => List<String>.from(b['approved_by'] ?? const <String>[]).contains(Api.signatory);
+
+  int get _awaitingMe => all.where((b) => b['status'] == 'pending' && !_iSigned(b)).length;
+
+  Future<void> _decide(Map<String, dynamic> b, String status) async {
+    if (status == 'cancelled') {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (c) => AlertDialog(
+          title: const Text('Cancel booking'),
+          content: Text('Cancel ${b['room_name']} on ${shortDate(b['date'].toString())} and free the slot?'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Keep')),
+            FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Cancel booking')),
+          ],
+        ),
+      );
+      if (ok != true) return;
+    }
+    if (status == 'approved' && b['has_contention'] == true) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (c) => AlertDialog(
+          title: const Text('Slot contention'),
+          content: const Text('Another pending or approved request overlaps this slot. Approve anyway?'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+            FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Approve anyway')),
+          ],
+        ),
+      );
+      if (ok != true) return;
+    }
+    final r = await Api.call('PATCH', '/bookings/${b['id']}', body: {'status': status});
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(r.ok ? 'Request ${Api._ref(b['id'].toString())} marked $status.' : r.error)),
+    );
+    _load();
+  }
+
+  Future<void> _reset() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('Reset demo data'),
+        content: const Text('Delete all bookings?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (ok == true) {
+      await Api.call('POST', '/demo/reset', body: {});
+      _load();
+    }
+  }
+
+  Map<String, List<Map<String, dynamic>>> _byDay() {
+    final m = '${month.year}-${pad(month.month)}-';
+    final out = <String, List<Map<String, dynamic>>>{};
+    for (final bk in all) {
+      if (bk['status'] == 'rejected') continue;
+      if (bld != 'ALL' && bk['code'] != bld) continue;
+      final d = bk['date'].toString();
+      if (!d.startsWith(m)) continue;
+      out.putIfAbsent(d, () => []).add(bk);
+    }
+    for (final l in out.values) {
+      l.sort((x, y) => (x['start_min'] as int).compareTo(y['start_min'] as int));
+    }
+    return out;
+  }
+
+  Widget _calChip(Map<String, dynamic> b) {
+    final ac = accentFor((b['code'] ?? '').toString());
+    final appr = b['status'] == 'approved';
+    final onSolid = ac.computeLuminance() > .4 ? C.ink : Colors.white;
+    final t = fmt(b['start_min'] as int).replaceAll(':00', '');
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 3),
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+      decoration: BoxDecoration(
+        color: appr ? ac : ac.withAlpha(30),
+        borderRadius: BorderRadius.circular(5),
+        border: Border.all(color: ac),
+      ),
+      child: Text('$t ${b['room_name']}',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(fontSize: 10, fontWeight: FontWeight.w700, color: appr ? onSolid : C.ink)),
+    );
+  }
+
+  Widget _calLegend(Widget swatch, String t) => Row(mainAxisSize: MainAxisSize.min, children: [
+        swatch,
+        const SizedBox(width: 5),
+        Text(t, style: const TextStyle(fontSize: 12, color: C.mut)),
+      ]);
+
+  Widget _calendar(bool big) {
+    final today = iso(DateTime.now());
+    final byDay = _byDay();
+    final offset = month.weekday % 7; // Sunday first
+    final days = DateTime(month.year, month.month + 1, 0).day;
+    final rows = ((offset + days) / 7).ceil();
+    final cellH = big ? 118.0 : 64.0;
+
+    Widget cell(int idx) {
+      final d = idx - offset + 1;
+      if (d < 1 || d > days) return const SizedBox.shrink();
+      final ds = '${month.year}-${pad(month.month)}-${pad(d)}';
+      final items = byDay[ds] ?? const <Map<String, dynamic>>[];
+      final sel = ds == pickDay;
+      final isToday = ds == today;
+      return InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: () => setState(() {
+          pickDay = sel ? null : ds;
+          if (pickDay != null) tab = 'all';
+        }),
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(5),
+          decoration: BoxDecoration(
+            color: sel ? C.tint : Colors.white,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: (sel || isToday) ? C.blue : C.line, width: (sel || isToday) ? 1.8 : 1),
+          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              Text('$d',
+                  style: TextStyle(
+                      fontWeight: FontWeight.w800, fontSize: 13, color: isToday ? C.blue : C.ink)),
+              const Spacer(),
+              if (!big && items.isNotEmpty)
+                Text('${items.length}',
+                    style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w800, color: C.mut)),
+            ]),
+            const SizedBox(height: 3),
+            if (big) ...[
+              for (final b in items.take(3)) _calChip(b),
+              if (items.length > 3)
+                Text('+${items.length - 3} more',
+                    style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w700, color: C.mut)),
+            ] else
+              Wrap(spacing: 3, runSpacing: 3, children: [
+                for (final b in items.take(6))
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: accentFor((b['code'] ?? '').toString()),
+                    ),
+                  ),
+              ]),
+          ]),
+        ),
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: cardDeco(),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.calendar_month_rounded, color: C.blue, size: 22),
+          const SizedBox(width: 8),
+          const Expanded(
+            child: Text('Booking calendar', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 17)),
+          ),
+          IconButton.outlined(
+            onPressed: () => setState(() => month = DateTime(month.year, month.month - 1, 1)),
+            icon: const Icon(Icons.chevron_left_rounded),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            child: Text('${_months[month.month - 1]} ${month.year}',
+                style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+          ),
+          IconButton.outlined(
+            onPressed: () => setState(() => month = DateTime(month.year, month.month + 1, 1)),
+            icon: const Icon(Icons.chevron_right_rounded),
+          ),
+        ]),
+        const SizedBox(height: 12),
+        Row(children: [
+          for (final w in const ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'])
+            Expanded(
+              child: Center(
+                child: Text(w, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: C.mut)),
+              ),
+            ),
+        ]),
+        const SizedBox(height: 6),
+        for (var r = 0; r < rows; r++)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: SizedBox(
+              height: cellH,
+              child: Row(children: [
+                for (var c = 0; c < 7; c++)
+                  Expanded(child: Padding(padding: const EdgeInsets.symmetric(horizontal: 3), child: cell(r * 7 + c))),
+              ]),
+            ),
+          ),
+        const SizedBox(height: 6),
+        Wrap(spacing: 16, runSpacing: 6, children: [
+          _calLegend(
+              Container(
+                width: 14,
+                height: 10,
+                decoration: BoxDecoration(color: C.blue, borderRadius: BorderRadius.circular(3)),
+              ),
+              'Approved'),
+          _calLegend(
+              Container(
+                width: 14,
+                height: 10,
+                decoration: BoxDecoration(
+                  color: C.blue.withAlpha(30),
+                  borderRadius: BorderRadius.circular(3),
+                  border: Border.all(color: C.blue),
+                ),
+              ),
+              'Pending'),
+          const Text('Colors = building · tap a day to filter the list below',
+              style: TextStyle(fontSize: 12, color: C.mut)),
+        ]),
+      ]),
+    );
+  }
+
+  Widget _filters() {
+    const tabs = [
+      ['pending', 'Pending'],
+      ['approved', 'Approved'],
+      ['rejected', 'Rejected'],
+      ['all', 'All'],
+    ];
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: cardDeco(),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        TextField(
+          controller: search,
+          decoration: const InputDecoration(
+            hintText: 'Search requester, room, purpose or organization…',
+            prefixIcon: Icon(Icons.search_rounded),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          for (final t in tabs)
+            ChoiceChip(
+              label: Text('${t[1]} · ${_count(t[0])}', style: const TextStyle(fontWeight: FontWeight.w700)),
+              selected: tab == t[0],
+              selectedColor: C.tint,
+              onSelected: (_) => setState(() => tab = t[0]),
+            ),
+        ]),
+        const SizedBox(height: 10),
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(children: [
+            for (final code in _codes)
+              Padding(
+                padding: const EdgeInsets.only(right: 8),
+                child: ChoiceChip(
+                  avatar: code == 'ALL' ? null : Icon(Icons.circle, size: 10, color: accentFor(code)),
+                  label: Text(code == 'ALL' ? 'All buildings' : bldName(code),
+                      style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 12.5)),
+                  selected: bld == code,
+                  selectedColor: code == 'ALL' ? C.tint : accentFor(code).withAlpha(40),
+                  onSelected: (_) => setState(() => bld = code),
+                ),
+              ),
+          ]),
+        ),
+      ]),
+    );
+  }
+
+  Widget _card(Map<String, dynamic> b) {
+    final st = b['status'].toString();
+    final kind = st == 'approved' ? 'good' : st == 'pending' ? 'warn' : 'bad';
+    final code = (b['code'] ?? '').toString();
+    final ac = accentFor(code);
+    final att = (b['attendees'] as int?) ?? 0;
+    final cap = (b['room_capacity'] as int?) ?? 1;
+    final ratio = cap == 0 ? 0.0 : (att / cap).clamp(0.0, 1.0).toDouble();
+    final nearCap = b['near_capacity'] == true;
+    final contention = b['has_contention'] == true;
+    return Container(
+      decoration: BoxDecoration(
+        color: Color.alphaBlend(ac.withAlpha(16), Colors.white),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: ac.withAlpha(90)),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: IntrinsicHeight(
+        child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Container(width: 7, color: ac),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Container(
+                    width: 44,
+                    height: 44,
+                    decoration: BoxDecoration(color: ac.withAlpha(34), borderRadius: BorderRadius.circular(12)),
+                    child: Icon(buildingIcon(code), color: ac),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text(b['room_name'].toString(),
+                          style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+                      Text('${bldName(code)} · ${b['requester_name']}',
+                          style: TextStyle(color: ac, fontWeight: FontWeight.w700, fontSize: 12.5)),
+                    ]),
+                  ),
+                  StatusChip(st, kind),
+                ]),
+                const SizedBox(height: 12),
+                Wrap(spacing: 14, runSpacing: 4, children: [
+                  Row(mainAxisSize: MainAxisSize.min, children: [
+                    const Icon(Icons.calendar_today_rounded, size: 15, color: C.mut),
+                    const SizedBox(width: 6),
+                    Text(shortDate(b['date'].toString()),
+                        style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+                  ]),
+                  Row(mainAxisSize: MainAxisSize.min, children: [
+                    const Icon(Icons.schedule_rounded, size: 15, color: C.mut),
+                    const SizedBox(width: 6),
+                    Text('${fmt(b['start_min'] as int)} – ${fmt(b['end_min'] as int)}',
+                        style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+                  ]),
+                ]),
+                const SizedBox(height: 8),
+                Text('${b['purpose']} · ${b['organization']}',
+                    style: const TextStyle(fontSize: 12.5, color: C.mut)),
+                const SizedBox(height: 10),
+                Row(children: [
+                  Text('$att / $cap people', style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700)),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(99),
+                      child: LinearProgressIndicator(
+                        value: ratio,
+                        minHeight: 6,
+                        backgroundColor: C.line,
+                        color: nearCap ? C.busyInk : ac,
+                      ),
+                    ),
+                  ),
+                ]),
+                if (nearCap || contention) ...[
+                  const SizedBox(height: 8),
+                  Wrap(spacing: 6, runSpacing: 6, children: [
+                    if (nearCap) const StatusChip('Near Capacity (>=85%)', 'warn'),
+                    if (contention) const StatusChip('Slot Contention Alert', 'bad'),
+                  ]),
+                ],
+                const SizedBox(height: 10),
+                SignatureChips(b),
+                const SizedBox(height: 12),
+                Wrap(spacing: 8, runSpacing: 8, children: [
+                  if (Api.isSignatory) ...[
+                    if (st == 'pending' && !_iSigned(b)) ...[
+                      Btn('Approve', small: true, icon: Icons.check_rounded, onTap: () => _decide(b, 'approved')),
+                      Btn('Reject',
+                          small: true, outlined: true, icon: Icons.close_rounded, onTap: () => _decide(b, 'rejected')),
+                    ] else if (st == 'approved' || st == 'rejected' || (st == 'pending' && _iSigned(b)))
+                      Btn('Undo my decision',
+                          small: true, outlined: true, icon: Icons.undo_rounded, onTap: () => _decide(b, 'pending')),
+                  ] else if (Api.isAdmin && (st == 'pending' || st == 'approved'))
+                    Btn('Cancel booking',
+                        small: true, outlined: true, icon: Icons.event_busy_rounded, onTap: () => _decide(b, 'cancelled')),
+                  Btn('Letter',
+                      small: true,
+                      outlined: true,
+                      icon: Icons.description_outlined,
+                      onTap: () => Api.openLetter(b['id'].toString())),
+                ]),
+              ]),
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  Widget _todayCard() {
+    final today = iso(DateTime.now());
+    final items = all.where((b) => b['date'] == today && b['status'] == 'approved').toList()
+      ..sort((a, b) => (a['start_min'] as int).compareTo(b['start_min'] as int));
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: cardDeco(),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Row(children: [
+          Icon(Icons.today_rounded, color: C.blue, size: 20),
+          SizedBox(width: 8),
+          Text('Approved today', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+        ]),
+        const SizedBox(height: 10),
+        if (items.isEmpty)
+          const Text('Nothing approved for today yet.', style: TextStyle(fontSize: 12.5, color: C.mut))
+        else
+          for (final b in items)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Row(children: [
+                Icon(Icons.circle, size: 10, color: accentFor((b['code'] ?? '').toString())),
+                const SizedBox(width: 8),
+                SizedBox(
+                  width: 112,
+                  child: Text('${fmt(b['start_min'] as int)} – ${fmt(b['end_min'] as int)}',
+                      style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 12)),
+                ),
+                Expanded(
+                  child: Text('${b['room_name']} · ${b['purpose']}',
+                      overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12.5, color: C.mut)),
+                ),
+              ]),
+            ),
+      ]),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final wide = MediaQuery.of(context).size.width >= 980;
+    final list = _filtered;
+    final main = Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text('Requests · ${list.length}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+      const SizedBox(height: 10),
+      _filters(),
+      if (pickDay != null)
+        Padding(
+          padding: const EdgeInsets.only(top: 10),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: InputChip(
+              avatar: const Icon(Icons.event_rounded, size: 16, color: C.blue),
+              label: Text('Showing ${longDate(pickDay!)}', style: const TextStyle(fontWeight: FontWeight.w700)),
+              onDeleted: () => setState(() => pickDay = null),
+            ),
+          ),
+        ),
+      const SizedBox(height: 14),
+      if (list.isEmpty)
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(vertical: 40),
+          decoration: cardDeco(),
+          child: const Center(child: Text('No requests match these filters.', style: TextStyle(color: C.mut))),
+        )
+      else
+        for (final b in list) Padding(padding: const EdgeInsets.only(bottom: 12), child: _card(b)),
+    ]);
+    final side = Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      AnalyticsCard(stats: stats, wide: false),
+      const SizedBox(height: 16),
+      _todayCard(),
+      if (Api.isAdmin) ...[
+        const SizedBox(height: 16),
+        Btn('Reset demo data', small: true, outlined: true, icon: Icons.refresh_rounded, onTap: _reset),
+      ],
+    ]);
+    return Shell(
+      active: 'admin',
+      child: PageBody(children: [
+        HeaderBanner(
+          code: 'CIT',
+          icon: Api.isAdmin ? Icons.admin_panel_settings_rounded : Icons.draw_rounded,
+          title: Api.isAdmin ? 'Admin Console' : 'Approvals · ${Api.signatory}',
+          subtitle: loading
+              ? 'Loading…'
+              : Api.isAdmin
+                  ? '${_count('pending')} request(s) waiting for the signatories'
+                  : '$_awaitingMe request(s) waiting for your signature',
+        ),
+        if (Api.isAdmin)
+          const Alert(
+              'Room admins manage the rooms and bookings. Requests are approved by the signatories '
+              '(deans, University Librarian, GSO Head and, above 100 attendees, the University President).',
+              'warn'),
+        const SizedBox(height: 16),
+        if (loading)
+          const Loading()
+        else if (error != null)
+          Alert(error!, 'bad')
+        else ...[
+          _calendar(MediaQuery.of(context).size.width >= 760),
+          const SizedBox(height: 20),
+          if (wide)
+            Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Expanded(flex: 7, child: main),
+              const SizedBox(width: 16),
+              SizedBox(width: 360, child: side),
+            ])
+          else ...[
+            side,
+            const SizedBox(height: 16),
+            main,
+          ],
         ],
       ]),
     );
